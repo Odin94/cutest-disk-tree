@@ -24,6 +24,7 @@ out/
 src-tauri/target/
 src-tauri/WixTools/
 src-tauri/gen/
+release-out/
 
 # IDE / OS
 .idea/
@@ -39,3 +40,5 @@ coverage/
 *.profdata
 
 .cursor/
+.tauri-private-key
+.tauri-public-key.decoded

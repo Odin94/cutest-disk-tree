@@ -3,6 +3,8 @@ use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 use serde::Serialize;
 
+pub mod db;
+
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Serialize)]
 pub struct FileKey {
     pub dev: u64,
@@ -115,18 +117,26 @@ pub fn index_directory(root: &Path) -> (Vec<FileEntry>, HashMap<std::path::PathB
 
 pub fn index_directory_serializable(root: &Path) -> Option<ScanResult> {
     let (files, folder_sizes) = index_directory(root);
+    to_scan_result(root, &files, &folder_sizes)
+}
+
+pub fn to_scan_result(
+    root: &Path,
+    files: &[FileEntry],
+    folder_sizes: &HashMap<std::path::PathBuf, u64>,
+) -> Option<ScanResult> {
     let root_str = root.to_string_lossy().to_string();
     let files_ser: Vec<FileEntrySer> = files
-        .into_iter()
+        .iter()
         .map(|(p, s, k)| FileEntrySer {
             path: p.to_string_lossy().to_string(),
-            size: s,
-            file_key: k,
+            size: *s,
+            file_key: *k,
         })
         .collect();
     let folder_sizes_ser: HashMap<String, u64> = folder_sizes
-        .into_iter()
-        .map(|(p, s)| (p.to_string_lossy().to_string(), s))
+        .iter()
+        .map(|(p, s)| (p.to_string_lossy().to_string(), *s))
         .collect();
     Some(ScanResult {
         root: root_str,

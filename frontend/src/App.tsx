@@ -4,6 +4,49 @@ import type { ScanResult } from "./types";
 import { humanSize } from "./utils";
 import "./App.css";
 
+const CheckForUpdatesButton = () => {
+  const [checking, setChecking] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const check = async () => {
+    setChecking(true);
+    setMessage(null);
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check();
+      if (update != null) {
+        setMessage(`Update ${update.version} available. Downloading…`);
+        const { relaunch } = await import("@tauri-apps/plugin-process");
+        await update.downloadAndInstall();
+        setMessage("Update installed. Restarting…");
+        await relaunch();
+      } else {
+        setMessage("No updates available.");
+      }
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <span className="updater-wrap">
+      <button
+        type="button"
+        className="secondary"
+        onClick={check}
+        disabled={checking}
+      >
+        {checking ? "Checking…" : "Check for updates"}
+      </button>
+      {message != null ? (
+        <span className="updater-message">{message}</span>
+      ) : null}
+    </span>
+  );
+};
+
 type TabId = "folders" | "files" | "duplicates";
 
 const App = () => {
@@ -65,14 +108,17 @@ const App = () => {
     <div className="app">
       <header className="header">
         <h1>Cutest Disk Tree</h1>
-        <button
-          type="button"
-          className="primary"
-          onClick={runScan}
-          disabled={loading}
-        >
-          {loading ? "Scanning…" : "Choose folder to scan"}
-        </button>
+        <div className="header-actions">
+          <button
+            type="button"
+            className="primary"
+            onClick={runScan}
+            disabled={loading}
+          >
+            {loading ? "Scanning…" : "Choose folder to scan"}
+          </button>
+          <CheckForUpdatesButton />
+        </div>
       </header>
 
       {error ? (

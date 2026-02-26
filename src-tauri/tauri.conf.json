@@ -24,6 +24,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -32,5 +33,13 @@
     "longDescription": "Cross-platform disk usage and duplicate-file analyzer.",
     "shortDescription": "Disk usage analyzer",
     "category": "Utility"
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Odin94/cutest-disk-tree/releases/latest/download/latest.json"
+      ],
+      "pubkey": "untrusted comment: minisign public key: 396AC07C838046C1\nRWTBRoCDfMBqOSf/aAJxvIlJvFCthsa9VjsaaBvd8cfxb6aZBvuQljmD"
+    }
   }
 }

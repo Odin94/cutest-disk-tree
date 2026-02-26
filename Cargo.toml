@@ -1,0 +1,11 @@
+[package]
+name = "cutest-disk-tree"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform disk usage and duplicate-file analyzer"
+
+[dependencies]
+walkdir = "2.4"
+
+[target.'cfg(windows)'.dependencies]
+win-file-id = "0.1"

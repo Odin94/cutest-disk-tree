@@ -1,0 +1,41 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / TypeScript / React
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local
+.eslintcache
+*.log
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/gen/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Debug / coverage
+coverage/
+*.profraw
+*.profdata
+
+.cursor/

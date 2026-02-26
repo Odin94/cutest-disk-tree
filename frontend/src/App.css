@@ -1,0 +1,164 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 14px;
+  background: #1a1b1e;
+  color: #e4e4e7;
+  min-height: 100vh;
+}
+
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1rem 1.5rem;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.5rem;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.primary {
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  background: #3b82f6;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.primary:hover:not(:disabled) {
+  background: #2563eb;
+}
+
+.primary:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.error {
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  background: #7f1d1d;
+  color: #fecaca;
+  border-radius: 6px;
+}
+
+.summary {
+  margin-bottom: 1rem;
+  padding: 1rem;
+  background: #27272a;
+  border-radius: 8px;
+}
+
+.summary-row {
+  margin-bottom: 0.25rem;
+}
+
+.summary-row .label {
+  color: #a1a1aa;
+  margin-right: 0.5rem;
+}
+
+.summary-row .path {
+  word-break: break-all;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 0.75rem;
+}
+
+.tab {
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+  background: #27272a;
+  color: #a1a1aa;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: #e4e4e7;
+}
+
+.tab.active {
+  background: #3f3f46;
+  color: #fff;
+}
+
+.panel {
+  background: #27272a;
+  border-radius: 8px;
+  overflow: hidden;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.list-item {
+  display: flex;
+  gap: 1rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid #3f3f46;
+}
+
+.list-item:last-child {
+  border-bottom: none;
+}
+
+.list-item .size {
+  flex-shrink: 0;
+  width: 5rem;
+  font-variant-numeric: tabular-nums;
+  color: #a1a1aa;
+}
+
+.list-item .path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.placeholder {
+  padding: 2rem;
+  text-align: center;
+  color: #71717a;
+}
+
+.placeholder p {
+  margin: 0 0 0.5rem;
+}
+
+.placeholder p:last-child {
+  margin-bottom: 0;
+}
+
+.empty {
+  padding: 3rem;
+  text-align: center;
+  color: #71717a;
+}

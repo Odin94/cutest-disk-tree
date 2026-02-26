@@ -31,38 +31,59 @@ pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)
 }
 
+const BATCH_SIZE: usize = 200;
+
 pub fn write_scan(
     conn: &Connection,
     root: &str,
     files: &[(std::path::PathBuf, u64, FileKey)],
     folder_sizes: &std::collections::HashMap<std::path::PathBuf, u64>,
 ) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM files WHERE root = ?1", [root])?;
-    conn.execute("DELETE FROM folders WHERE root = ?1", [root])?;
+    let tx = conn.unchecked_transaction()?;
 
-    let mut file_stmt = conn.prepare(
-        "INSERT INTO files (root, path, size, dev, ino, hash, mtime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
-    for (path, size, key) in files {
-        let path_str = path.to_string_lossy();
-        file_stmt.execute((
-            root,
-            path_str.as_ref(),
-            *size as i64,
-            key.dev as i64,
-            key.ino as i64,
-            None::<&str>,
-            None::<i64>,
-        ))?;
+    tx.execute("DELETE FROM files WHERE root = ?1", [root])?;
+    tx.execute("DELETE FROM folders WHERE root = ?1", [root])?;
+
+    for chunk in files.chunks(BATCH_SIZE) {
+        let row_placeholders = (0..chunk.len()).map(|_| "(?, ?, ?, ?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "INSERT INTO files (root, path, size, dev, ino, hash, mtime) VALUES {}",
+            row_placeholders
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> = Vec::with_capacity(chunk.len() * 7);
+        for (path, size, key) in chunk {
+            let path_str = path.to_string_lossy().to_string();
+            params.push(Box::new(root));
+            params.push(Box::new(path_str));
+            params.push(Box::new(*size as i64));
+            params.push(Box::new(key.dev as i64));
+            params.push(Box::new(key.ino as i64));
+            params.push(Box::new(None::<String>));
+            params.push(Box::new(None::<i64>));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
     }
 
-    let mut folder_stmt =
-        conn.prepare("INSERT INTO folders (root, path, recursive_size) VALUES (?1, ?2, ?3)")?;
-    for (path, size) in folder_sizes {
-        let path_str = path.to_string_lossy();
-        folder_stmt.execute((root, path_str.as_ref(), *size as i64))?;
+    let folder_vec: Vec<_> = folder_sizes.iter().collect();
+    for chunk in folder_vec.chunks(BATCH_SIZE) {
+        let row_placeholders = (0..chunk.len()).map(|_| "(?, ?, ?)").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "INSERT INTO folders (root, path, recursive_size) VALUES {}",
+            row_placeholders
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> = Vec::with_capacity(chunk.len() * 3);
+        for (path, size) in chunk.iter() {
+            let path_str = path.to_string_lossy().to_string();
+            params.push(Box::new(root));
+            params.push(Box::new(path_str));
+            params.push(Box::new(**size as i64));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
     }
 
+    tx.commit()?;
     Ok(())
 }
 

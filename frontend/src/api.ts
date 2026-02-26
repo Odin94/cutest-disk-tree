@@ -1,9 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ScanResult } from "./types";
+import type { ScanResult, ScanProgress } from "./types";
 
 export const scanDirectory = (path: string): Promise<ScanResult> =>
   invoke("scan_directory", { path });
+
+export const onScanProgress = (callback: (progress: ScanProgress) => void) => {
+  const unlisten = listen<ScanProgress>("scan-progress", (event) => {
+    callback(event.payload);
+  });
+  return unlisten;
+};
 
 export const listCachedRoots = (): Promise<string[]> =>
   invoke("list_cached_roots", {});

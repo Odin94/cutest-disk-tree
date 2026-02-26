@@ -6,6 +6,7 @@ description = "Cross-platform disk usage and duplicate-file analyzer"
 
 [dependencies]
 walkdir = "2.4"
+jwalk = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
@@ -15,3 +16,6 @@ win-file-id = "0.1"
 [[bin]]
 name = "cutest-disk-tree"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

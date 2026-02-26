@@ -1,6 +1,6 @@
-import { useState } from "react";
-import { scanDirectory, pickDirectory } from "./api";
-import type { ScanResult } from "./types";
+import { useState, useRef } from "react";
+import { scanDirectory, pickDirectory, onScanProgress } from "./api";
+import type { ScanResult, ScanProgress } from "./types";
 import { humanSize } from "./utils";
 import "./App.css";
 
@@ -52,22 +52,31 @@ type TabId = "folders" | "files" | "duplicates";
 const App = () => {
   const [result, setResult] = useState<ScanResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>("folders");
+  const unlistenRef = useRef<(() => void) | null>(null);
 
   const runScan = async () => {
     const path = await pickDirectory();
     if (path === null) return;
     setLoading(true);
+    setProgress(null);
     setError(null);
     try {
+      unlistenRef.current = await onScanProgress((p) => setProgress(p));
       const data = await scanDirectory(path);
       setResult(data);
       setActiveTab("folders");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
+      if (unlistenRef.current) {
+        unlistenRef.current();
+        unlistenRef.current = null;
+      }
       setLoading(false);
+      setProgress(null);
     }
   };
 
@@ -123,6 +132,26 @@ const App = () => {
 
       {error ? (
         <div className="error">{error}</div>
+      ) : null}
+
+      {loading ? (
+        <div className="progress-panel">
+          <div className="progress-bar" role="progressbar" aria-valuenow={progress?.files_count ?? 0} aria-label="Scanning files">
+            <div className="progress-bar-inner" />
+          </div>
+          <p className="progress-text">
+            {progress?.status != null
+              ? progress.status
+              : progress != null
+                ? `${progress.files_count.toLocaleString()} files scanned…`
+                : "Starting scan…"}
+          </p>
+          {progress?.current_path != null && progress?.status == null ? (
+            <p className="progress-path" title={progress.current_path}>
+              {progress.current_path}
+            </p>
+          ) : null}
+        </div>
       ) : null}
 
       {result !== null && !loading ? (

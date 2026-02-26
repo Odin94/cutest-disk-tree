@@ -199,3 +199,45 @@ body {
   text-align: center;
   color: #71717a;
 }
+
+.progress-panel {
+  padding: 1.5rem;
+  background: #27272a;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+}
+
+.progress-bar {
+  height: 8px;
+  background: #3f3f46;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 0.75rem;
+}
+
+.progress-bar-inner {
+  height: 100%;
+  width: 30%;
+  background: #3b82f6;
+  border-radius: 4px;
+  animation: progress-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes progress-pulse {
+  0%, 100% { transform: translateX(-100%); }
+  50% { transform: translateX(233%); }
+}
+
+.progress-text {
+  margin: 0 0 0.25rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-path {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #71717a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

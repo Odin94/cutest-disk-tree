@@ -1,9 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
+use jwalk::WalkDir as JwalkDir;
 use serde::Serialize;
 
 pub mod db;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScanProgress {
+    pub files_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Serialize)]
 pub struct FileKey {
@@ -76,7 +86,22 @@ fn path_ancestors(path: &Path) -> Vec<std::path::PathBuf> {
 
 pub type FileEntry = (std::path::PathBuf, u64, FileKey);
 
+const PROGRESS_INTERVAL: u64 = 200;
+
 pub fn index_directory(root: &Path) -> (Vec<FileEntry>, HashMap<std::path::PathBuf, u64>) {
+    index_directory_with_progress(root, |_| {})
+}
+
+pub fn index_directory_with_progress<F>(root: &Path, mut progress: F) -> (Vec<FileEntry>, HashMap<std::path::PathBuf, u64>)
+where
+    F: FnMut(ScanProgress),
+{
+    progress(ScanProgress {
+        files_count: 0,
+        current_path: None,
+        status: None,
+    });
+
     let mut files: Vec<FileEntry> = Vec::new();
     let walker = WalkDir::new(root)
         .follow_links(false)
@@ -89,17 +114,44 @@ pub fn index_directory(root: &Path) -> (Vec<FileEntry>, HashMap<std::path::PathB
             if let Ok(meta) = entry.metadata() {
                 let size = meta.len();
                 if let Some(key) = file_key_from_path(&path) {
-                    files.push((path, size, key));
+                    files.push((path.clone(), size, key));
+                    if files.len() as u64 % PROGRESS_INTERVAL == 0 {
+                        progress(ScanProgress {
+                            files_count: files.len() as u64,
+                            current_path: Some(path.to_string_lossy().to_string()),
+                            status: None,
+                        });
+                    }
                 }
             }
         }
     }
 
+    progress(ScanProgress {
+        files_count: files.len() as u64,
+        current_path: None,
+        status: None,
+    });
+
+    progress(ScanProgress {
+        files_count: files.len() as u64,
+        current_path: None,
+        status: Some("Computing folder sizes…".into()),
+    });
+
+    let folder_sizes = aggregate_folder_sizes(root, &files);
+
+    (files, folder_sizes)
+}
+
+fn aggregate_folder_sizes(
+    root: &Path,
+    files: &[FileEntry],
+) -> HashMap<std::path::PathBuf, u64> {
     let mut seen: HashSet<FileKey> = HashSet::new();
     let mut folder_sizes: HashMap<std::path::PathBuf, u64> = HashMap::new();
     let root_buf = root.to_path_buf();
-
-    for (path, size, key) in &files {
+    for (path, size, key) in files {
         if seen.contains(key) {
             continue;
         }
@@ -111,6 +163,72 @@ pub fn index_directory(root: &Path) -> (Vec<FileEntry>, HashMap<std::path::PathB
             }
         }
     }
+    folder_sizes
+}
+
+pub fn index_directory_parallel_with_progress<F>(
+    root: &Path,
+    mut progress: F,
+) -> (Vec<FileEntry>, HashMap<std::path::PathBuf, u64>)
+where
+    F: FnMut(ScanProgress),
+{
+    progress(ScanProgress {
+        files_count: 0,
+        current_path: None,
+        status: Some("Scanning files…".into()),
+    });
+
+    let mut files: Vec<FileEntry> = Vec::new();
+    let walk = match JwalkDir::new(root).follow_links(false).try_into_iter() {
+        Ok(w) => w,
+        Err(_) => {
+            progress(ScanProgress {
+                files_count: 0,
+                current_path: None,
+                status: Some("Scan failed (try_into_iter)".into()),
+            });
+            return (files, HashMap::new());
+        }
+    };
+
+    for entry in walk.filter_map(Result::ok) {
+        if entry.path_is_symlink() || !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let size = meta.len();
+        let key = match file_key_from_path(&path) {
+            Some(k) => k,
+            None => continue,
+        };
+        files.push((path.clone(), size, key));
+        if files.len() as u64 % PROGRESS_INTERVAL == 0 {
+            progress(ScanProgress {
+                files_count: files.len() as u64,
+                current_path: Some(path.to_string_lossy().to_string()),
+                status: None,
+            });
+        }
+    }
+
+    progress(ScanProgress {
+        files_count: files.len() as u64,
+        current_path: None,
+        status: None,
+    });
+
+    progress(ScanProgress {
+        files_count: files.len() as u64,
+        current_path: None,
+        status: Some("Computing folder sizes…".into()),
+    });
+
+    let folder_sizes = aggregate_folder_sizes(root, &files);
 
     (files, folder_sizes)
 }

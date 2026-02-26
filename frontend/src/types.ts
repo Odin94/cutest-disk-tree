@@ -6,6 +6,12 @@ export type FileEntry = {
   file_key: FileKey;
 };
 
+export type ScanProgress = {
+  files_count: number;
+  current_path?: string;
+  status?: string;
+};
+
 export type ScanResult = {
   root: string;
   files: FileEntry[];

@@ -1,25 +1,46 @@
-use cutest_disk_tree::{db, index_directory};
+use cutest_disk_tree::{db, index_directory_parallel_with_progress};
 use std::path::Path;
 use tauri::Manager;
+use tauri::Emitter;
 
 struct AppState {
     db_path: std::path::PathBuf,
 }
 
 #[tauri::command]
-fn scan_directory(
-    state: tauri::State<AppState>,
+async fn scan_directory(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<cutest_disk_tree::ScanResult, String> {
-    let path_buf = Path::new(&path);
+    let path_buf = Path::new(&path).to_path_buf();
     if !path_buf.is_dir() {
         return Err(format!("Not a directory: {}", path));
     }
-    let (files, folder_sizes) = index_directory(path_buf);
-    let result = cutest_disk_tree::to_scan_result(path_buf, &files, &folder_sizes)
-        .ok_or("Indexing failed")?;
-    let conn = db::open_db(&state.db_path).map_err(|e| e.to_string())?;
-    db::write_scan(&conn, &path, &files, &folder_sizes).map_err(|e| e.to_string())?;
+    let db_path = state.db_path.clone();
+    let path_for_db = path.clone();
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let (files, folder_sizes) = index_directory_parallel_with_progress(&path_buf, |p| {
+            let _ = app.emit("scan-progress", &p);
+        });
+        let result = cutest_disk_tree::to_scan_result(&path_buf, &files, &folder_sizes)
+            .ok_or_else(|| "Indexing failed".to_string())?;
+        let _ = app.emit(
+            "scan-progress",
+            &cutest_disk_tree::ScanProgress {
+                files_count: files.len() as u64,
+                current_path: None,
+                status: Some("Saving to database…".into()),
+            },
+        );
+        let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
+        db::write_scan(&conn, &path_for_db, &files, &folder_sizes).map_err(|e| e.to_string())?;
+        Ok::<_, String>(result)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
     Ok(result)
 }
 

@@ -28,6 +28,14 @@ npm run tauri dev
 
 Scan results are stored in SQLite in the app data directory (`index.db`). Each scan overwrites data for that root path; you can re-scan to refresh.
 
+**Database location** (app identifier `com.cutest.disk-tree`):
+
+| OS | Path |
+|----|------|
+| **Windows** | `%APPDATA%\com.cutest.disk-tree\index.db` (e.g. `C:\Users\<You>\AppData\Roaming\com.cutest.disk-tree\index.db`) |
+| **macOS** | `~/Library/Application Support/com.cutest.disk-tree/index.db` |
+| **Linux** | `~/.local/share/com.cutest.disk-tree/index.db` (or `$XDG_DATA_HOME/com.cutest.disk-tree/index.db` if set) |
+
 **Build for production**:
 
 ```bash

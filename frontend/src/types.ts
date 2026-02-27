@@ -6,6 +6,8 @@ export type FileEntry = {
   file_key: FileKey;
 };
 
+export type SearchItemKind = "file" | "folder";
+
 export type ScanProgress = {
   files_count: number;
   current_path?: string;
@@ -18,4 +20,10 @@ export type ScanResult = {
   folder_sizes: Record<string, number>;
 };
 
-export type FileSearchResult = FileEntry;
+export type FileSearchResult = {
+  kind: SearchItemKind;
+  path: string;
+  size: number;
+  file_key?: FileKey;
+};
+

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { scanDirectory, pickDirectory, onScanProgress, findFiles } from "./api";
-import type { ScanResult, ScanProgress, FileEntry } from "./types";
+import type { ScanResult, ScanProgress, FileSearchResult } from "./types";
 import { humanSize } from "./utils";
 import "./App.css";
 import { Button } from "./components/ui/button";
@@ -59,6 +59,17 @@ const CheckForUpdatesButton = () => {
 type TabId = "folders" | "files" | "duplicates" | "find";
 type FindSortKey = "name" | "size" | "path";
 type FindSortDirection = "asc" | "desc";
+type FileCategory =
+  | "all"
+  | "audio"
+  | "document"
+  | "video"
+  | "image"
+  | "executable"
+  | "compressed"
+  | "config"
+  | "folder"
+  | "other";
 
 const App = () => {
   const [result, setResult] = useState<ScanResult | null>(null);
@@ -68,7 +79,8 @@ const App = () => {
   const [activeTab, setActiveTab] = useState<TabId>("folders");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchExtensions, setSearchExtensions] = useState("");
-  const [searchResults, setSearchResults] = useState<FileEntry[]>([]);
+  const [searchCategory, setSearchCategory] = useState<FileCategory>("all");
+  const [searchResults, setSearchResults] = useState<FileSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [findSortKey, setFindSortKey] = useState<FindSortKey>("name");
@@ -107,32 +119,47 @@ const App = () => {
     result === null
       ? 0
       : (() => {
-          const seen = new Set<string>();
-          let sum = 0;
-          for (const f of result.files) {
-            const k = `${f.file_key.dev}:${f.file_key.ino}`;
-            if (seen.has(k)) continue;
-            seen.add(k);
-            sum += f.size;
-          }
-          return sum;
-        })();
+        const seen = new Set<string>();
+        let sum = 0;
+        for (const f of result.files) {
+          const k = `${f.file_key.dev}:${f.file_key.ino}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          sum += f.size;
+        }
+        return sum;
+      })();
 
   const folderList =
     result === null
       ? []
       : Object.entries(result.folder_sizes)
-          .map(([path, size]) => ({ path, size }))
-          .sort((a, b) => b.size - a.size);
+        .map(([path, size]) => ({ path, size }))
+        .sort((a, b) => b.size - a.size);
 
   const largestFiles =
     result === null
       ? []
       : [...result.files]
-          .sort((a, b) => b.size - a.size)
-          .slice(0, 200);
+        .sort((a, b) => b.size - a.size)
+        .slice(0, 200);
 
   const canSearch = result !== null && !loading;
+
+  const getEffectiveExtensions = () => {
+    const manual =
+      searchExtensions.trim().length === 0
+        ? []
+        : searchExtensions
+          .split(",")
+          .map((raw) => raw.trim().replace(/^\./, ""))
+          .filter((raw) => raw.length > 0);
+    if (manual.length === 0) {
+      return "";
+    }
+    const unique = Array.from(new Set(manual.map((ext) => ext.toLowerCase())));
+    return unique.join(", ");
+  };
 
   const runSearch = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -145,7 +172,7 @@ const App = () => {
       const found = await findFiles(
         result.root,
         searchQuery,
-        searchExtensions
+        getEffectiveExtensions()
       );
       setSearchResults(found);
     } catch (e) {
@@ -163,7 +190,7 @@ const App = () => {
     const timeoutId = window.setTimeout(() => {
       setSearchLoading(true);
       setSearchError(null);
-      findFiles(result.root, searchQuery, searchExtensions)
+      findFiles(result.root, searchQuery, getEffectiveExtensions())
         .then((found) => {
           setSearchResults(found);
         })
@@ -188,7 +215,124 @@ const App = () => {
     return segments[segments.length - 1] ?? path;
   };
 
-  const sortedSearchResults = [...searchResults].sort((a, b) => {
+  const inferExtension = (path: string) => {
+    const name = getFileName(path);
+    const idx = name.lastIndexOf(".");
+    if (idx === -1 || idx === name.length - 1) {
+      return null;
+    }
+    return name.slice(idx + 1).toLowerCase();
+  };
+
+  const audioExts = [
+    "mp3",
+    "wav",
+    "flac",
+    "m4a",
+    "ogg",
+    "aac",
+    "opus",
+  ];
+  const documentExts = [
+    "pdf",
+    "txt",
+    "md",
+    "rtf",
+    "doc",
+    "docx",
+    "odt",
+    "xls",
+    "xlsx",
+    "csv",
+    "ppt",
+    "pptx",
+  ];
+  const videoExts = ["mp4", "mkv", "mov", "avi", "webm", "m4v"];
+  const imageExts = [
+    "jpg",
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "heic",
+    "bmp",
+    "tiff",
+    "svg",
+  ];
+  const executableExts = [
+    "exe",
+    "dll",
+    "so",
+    "dylib",
+    "bin",
+    "sh",
+    "bat",
+    "cmd",
+    "appimage",
+  ];
+  const compressedExts = ["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz"];
+  const configExts = [
+    "cfg",
+    "conf",
+    "ini",
+    "json",
+    "yaml",
+    "yml",
+    "toml",
+    "xml",
+    "props",
+    "properties",
+    "rc",
+    "config",
+    "env",
+  ];
+
+  const classifyFileCategory = (item: FileSearchResult): FileCategory => {
+    if (item.kind === "folder") {
+      return "folder";
+    }
+    const ext = inferExtension(item.path);
+    if (ext == null) {
+      return "other";
+    }
+    if (audioExts.includes(ext)) {
+      return "audio";
+    }
+    if (documentExts.includes(ext)) {
+      return "document";
+    }
+    if (videoExts.includes(ext)) {
+      return "video";
+    }
+    if (imageExts.includes(ext)) {
+      return "image";
+    }
+    if (executableExts.includes(ext)) {
+      return "executable";
+    }
+    if (compressedExts.includes(ext)) {
+      return "compressed";
+    }
+    if (configExts.includes(ext)) {
+      return "config";
+    }
+    return "other";
+  };
+
+  const filteredSearchResults = searchResults.filter((item) => {
+    if (searchCategory === "all") {
+      return true;
+    }
+    if (searchCategory === "folder") {
+      return item.kind === "folder";
+    }
+    if (item.kind === "folder") {
+      return false;
+    }
+    return classifyFileCategory(item) === searchCategory;
+  });
+
+  const sortedSearchResults = [...filteredSearchResults].sort((a, b) => {
     if (findSortKey === "size") {
       if (a.size === b.size) {
         return 0;
@@ -333,6 +477,27 @@ const App = () => {
                       />
                     </label>
                     <label className="find-field">
+                      <span className="find-label">Category</span>
+                      <select
+                        value={searchCategory}
+                        onChange={(e) =>
+                          setSearchCategory(e.target.value as FileCategory)
+                        }
+                        disabled={!canSearch}
+                      >
+                        <option value="all">All types</option>
+                        <option value="audio">Audio</option>
+                        <option value="document">Document</option>
+                        <option value="video">Video</option>
+                        <option value="image">Image</option>
+                        <option value="executable">Executable</option>
+                        <option value="compressed">Compressed</option>
+                        <option value="config">Config</option>
+                        <option value="folder">Folder</option>
+                        <option value="other">Other</option>
+                      </select>
+                    </label>
+                    <label className="find-field">
                       <span className="find-label">File endings</span>
                       <input
                         type="text"
@@ -415,7 +580,7 @@ const App = () => {
                     <TableBody>
                       {sortedSearchResults.map((f) => (
                         <TableRow
-                          key={`${f.path}:${f.file_key.dev}:${f.file_key.ino}`}
+                          key={`${f.path}:${f.file_key?.dev ?? "d"}:${f.file_key?.ino ?? "i"}`}
                         >
                           <TableCell
                             className="find-cell-name"

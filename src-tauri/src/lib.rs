@@ -4,6 +4,16 @@ use tauri::Manager;
 use tauri::Emitter;
 use nucleo::{Matcher, Config};
 use nucleo::pattern::{Pattern, CaseMatching, Normalization};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct SearchEntry {
+    path: String,
+    size: u64,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_key: Option<cutest_disk_tree::FileKey>,
+}
 
 struct AppState {
     db_path: std::path::PathBuf,
@@ -67,7 +77,7 @@ fn find_files(
     root: String,
     query: String,
     extensions: Option<String>,
-) -> Result<Vec<cutest_disk_tree::FileEntrySer>, String> {
+) -> Result<Vec<SearchEntry>, String> {
     let conn = db::open_db(&state.db_path).map_err(|e| e.to_string())?;
 
     let mut sql = String::from(
@@ -116,17 +126,18 @@ fn find_files(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
 
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
     if query.trim().is_empty() {
-        let mut results: Vec<cutest_disk_tree::FileEntrySer> = rows
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results: Vec<SearchEntry> = rows
             .into_iter()
-            .map(|(path, size, dev, ino)| cutest_disk_tree::FileEntrySer {
+            .map(|(path, size, dev, ino)| SearchEntry {
                 path,
                 size,
-                file_key: cutest_disk_tree::FileKey { dev, ino },
+                kind: "file".to_string(),
+                file_key: Some(cutest_disk_tree::FileKey { dev, ino }),
             })
             .collect();
 
@@ -140,10 +151,6 @@ fn find_files(
         .into_iter()
         .filter(|(path, _, _, _)| path.to_lowercase().contains(&q))
         .collect();
-
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let labels: Vec<String> = rows.iter().map(|(path, _, _, _)| path.clone()).collect();
 
@@ -161,20 +168,48 @@ fn find_files(
 
     scored.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let mut results: Vec<cutest_disk_tree::FileEntrySer> = Vec::new();
+    let mut results: Vec<SearchEntry> = Vec::new();
     for (label, _score) in scored.into_iter().take(200) {
         if let Some((path, size, dev, ino)) = rows
             .iter()
             .find(|(p, _, _, _)| p == label)
         {
-            results.push(cutest_disk_tree::FileEntrySer {
+            results.push(SearchEntry {
                 path: path.clone(),
                 size: *size,
-                file_key: cutest_disk_tree::FileKey {
+                kind: "file".to_string(),
+                file_key: Some(cutest_disk_tree::FileKey {
                     dev: *dev,
                     ino: *ino,
-                },
+                }),
             });
+        }
+    }
+
+    if !query.trim().is_empty() {
+        let mut folder_stmt = conn
+            .prepare("SELECT path, recursive_size FROM folders WHERE root = ?1")
+            .map_err(|e| e.to_string())?;
+        let folder_rows = folder_stmt
+            .query_map([&root], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+        for (path, recursive_size) in folder_rows.into_iter() {
+            if path.to_lowercase().contains(&q) {
+                results.push(SearchEntry {
+                    path,
+                    size: recursive_size,
+                    kind: "folder".to_string(),
+                    file_key: None,
+                });
+            }
         }
     }
 

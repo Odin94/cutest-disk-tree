@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ScanResult, ScanProgress, FileEntry } from "./types";
+import type { ScanResult, ScanProgress, FileSearchResult } from "./types";
 
 export const scanDirectory = (path: string): Promise<ScanResult> =>
   invoke("scan_directory", { path });
@@ -23,7 +23,7 @@ export const findFiles = (
   root: string,
   query: string,
   extensions: string
-): Promise<FileEntry[]> =>
+): Promise<FileSearchResult[]> =>
   invoke("find_files", {
     root,
     query,

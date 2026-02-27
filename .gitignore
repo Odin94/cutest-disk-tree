@@ -42,3 +42,5 @@ coverage/
 .cursor/
 .tauri-private-key
 .tauri-public-key.decoded
+
+test-data/

@@ -2,34 +2,7 @@ use rusqlite::Connection;
 use std::path::Path;
 
 use crate::FileKey;
-
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS files (
-    root TEXT NOT NULL,
-    path TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    dev INTEGER NOT NULL,
-    ino INTEGER NOT NULL,
-    hash TEXT,
-    mtime INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_files_root_path ON files(root, path);
-CREATE INDEX IF NOT EXISTS idx_files_root_size ON files(root, size DESC);
-CREATE INDEX IF NOT EXISTS idx_files_dev_ino ON files(dev, ino);
-CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash) WHERE hash IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS folders (
-    root TEXT NOT NULL,
-    path TEXT NOT NULL,
-    recursive_size INTEGER NOT NULL,
-    PRIMARY KEY (root, path)
-);
-CREATE INDEX IF NOT EXISTS idx_folders_root_size ON folders(root, recursive_size DESC);
-";
-
-pub fn create_tables(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA)
-}
+use super::migrations::migrations;
 
 const BATCH_SIZE: usize = 200;
 
@@ -45,14 +18,26 @@ pub fn write_scan(
     tx.execute("DELETE FROM folders WHERE root = ?1", [root])?;
 
     for chunk in files.chunks(BATCH_SIZE) {
-        let row_placeholders = (0..chunk.len()).map(|_| "(?, ?, ?, ?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
+        let row_placeholders = (0..chunk.len())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
-            "INSERT INTO files (root, path, size, dev, ino, hash, mtime) VALUES {}",
+            "INSERT INTO files (root, path, size, dev, ino, hash, mtime, name, type) VALUES {}",
             row_placeholders
         );
-        let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> = Vec::with_capacity(chunk.len() * 7);
+        let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> = Vec::with_capacity(chunk.len() * 9);
         for (path, size, key) in chunk {
             let path_str = path.to_string_lossy().to_string();
+            let name: Option<String> = path
+                .file_name()
+                .and_then(|os| os.to_str())
+                .map(|s| s.to_string());
+            let file_type: Option<String> = path
+                .extension()
+                .and_then(|os| os.to_str())
+                .map(|s| s.to_ascii_lowercase());
+
             params.push(Box::new(root));
             params.push(Box::new(path_str));
             params.push(Box::new(*size as i64));
@@ -60,6 +45,8 @@ pub fn write_scan(
             params.push(Box::new(key.ino as i64));
             params.push(Box::new(None::<String>));
             params.push(Box::new(None::<i64>));
+            params.push(Box::new(name));
+            params.push(Box::new(file_type));
         }
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
         tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
@@ -144,7 +131,9 @@ pub fn get_scan_result(
 }
 
 pub fn open_db(db_path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(db_path)?;
-    create_tables(&conn)?;
+    let mut conn = Connection::open(db_path)?;
+    migrations()
+        .to_latest(&mut conn)
+        .map_err(|_e| rusqlite::Error::ExecuteReturnedResults)?;
     Ok(conn)
 }

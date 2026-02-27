@@ -272,8 +272,8 @@ mod tests {
     fn path_ancestors_works() {
         let p = PathBuf::from("/a/b/c/file.txt");
         let a = path_ancestors(&p);
-        assert!(a.iter().any(|x| x == PathBuf::from("/a/b/c")));
-        assert!(a.iter().any(|x| x == PathBuf::from("/a/b")));
-        assert!(a.iter().any(|x| x == PathBuf::from("/a")));
+        assert!(a.iter().any(|x| *x == PathBuf::from("/a/b/c")));
+        assert!(a.iter().any(|x| *x == PathBuf::from("/a/b")));
+        assert!(a.iter().any(|x| *x == PathBuf::from("/a")));
     }
 }

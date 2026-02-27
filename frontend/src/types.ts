@@ -17,3 +17,5 @@ export type ScanResult = {
   files: FileEntry[];
   folder_sizes: Record<string, number>;
 };
+
+export type FileSearchResult = FileEntry;

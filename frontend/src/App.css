@@ -149,6 +149,121 @@ body {
   overflow-y: auto;
 }
 
+.find-panel {
+  padding: 0.75rem 1rem 1rem;
+}
+
+.find-form {
+  margin-bottom: 0.75rem;
+}
+
+.find-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: flex-end;
+}
+
+.find-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.find-label {
+  font-size: 0.75rem;
+  color: #a1a1aa;
+}
+
+.find-field input {
+  padding: 0.4rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid #3f3f46;
+  background: #18181b;
+  color: #e4e4e7;
+  font-size: 0.875rem;
+  min-width: 12rem;
+}
+
+.find-field input:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
+
+.find-help {
+  margin: 0.35rem 0 0;
+  font-size: 0.75rem;
+  color: #71717a;
+}
+
+.find-error {
+  margin-bottom: 0.5rem;
+}
+
+.find-table-wrap {
+  border-top: 1px solid #3f3f46;
+}
+
+.find-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.find-table thead {
+  position: sticky;
+  top: 0;
+  background: #18181b;
+  z-index: 1;
+}
+
+.find-table th,
+.find-table td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #3f3f46;
+  text-align: left;
+}
+
+.find-sort {
+  background: transparent;
+  border: none;
+  color: #e4e4e7;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+
+.find-sort:hover {
+  color: #fff;
+}
+
+.find-cell-name {
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.find-cell-size {
+  width: 6rem;
+  font-variant-numeric: tabular-nums;
+  color: #a1a1aa;
+}
+
+.find-cell-path {
+  max-width: 24rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.find-empty {
+  padding: 0.75rem 0.75rem 1rem;
+  text-align: center;
+  color: #71717a;
+}
+
 .list {
   list-style: none;
   margin: 0;

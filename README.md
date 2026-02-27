@@ -2,6 +2,12 @@
 
 Cross-platform disk usage and duplicate-file analyzer (Rust + Tauri + React + TypeScript).
 
+## Crate layout
+
+- **Core library (`cutest-disk-tree`)**: Rust library crate in `src/lib.rs` (plus `src/db/*`) that implements directory scanning, aggregation, and SQLite persistence. This is the shared core used by both the CLI and the Tauri app.
+- **CLI (`cutest-disk-tree` binary)**: Simple command-line entrypoint in `src/main.rs` that calls into the core library to index a single path. Built and run from the repo root with `cargo build` / `cargo run -- <path>`.
+- **Tauri desktop app (`cutest-disk-tree-tauri`)**: Tauri host crate in `src-tauri/` that depends on the core library (`cutest-disk-tree = { path = ".." }`) and exposes its functionality as Tauri commands. The UI is a React + TypeScript frontend (see the Tauri section below).
+
 ## Tauri app (React UI)
 
 **Prerequisites**: [Rust](https://rustup.rs), [Node.js](https://nodejs.org).

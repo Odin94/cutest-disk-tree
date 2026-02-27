@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ScanResult, ScanProgress } from "./types";
+import type { ScanResult, ScanProgress, FileEntry } from "./types";
 
 export const scanDirectory = (path: string): Promise<ScanResult> =>
   invoke("scan_directory", { path });
@@ -18,6 +18,17 @@ export const listCachedRoots = (): Promise<string[]> =>
 
 export const loadCachedScan = (root: string): Promise<ScanResult | null> =>
   invoke("load_cached_scan", { root });
+
+export const findFiles = (
+  root: string,
+  query: string,
+  extensions: string
+): Promise<FileEntry[]> =>
+  invoke("find_files", {
+    root,
+    query,
+    extensions: extensions.trim().length > 0 ? extensions : null,
+  });
 
 export const pickDirectory = async (): Promise<string | null> => {
   const selected = await open({

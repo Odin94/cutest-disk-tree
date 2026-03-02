@@ -17,11 +17,13 @@ import { DiskUsageSidebar } from "../components/DiskUsageSidebar";
 import { Button } from "../components/ui/button";
 
 type DiskUsageViewProps = {
+  externalScanRoot?: string | null;
   onScanStart?: () => void;
   onScanDone?: () => void;
 };
 
 export const DiskUsageView = ({
+  externalScanRoot,
   onScanStart,
   onScanDone,
 }: DiskUsageViewProps) => {
@@ -123,6 +125,41 @@ export const DiskUsageView = ({
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!externalScanRoot) {
+      return;
+    }
+    let cancelled = false;
+    const root = externalScanRoot;
+    (async () => {
+      try {
+        const scan = await loadCachedScan(root);
+        if (cancelled || scan == null) {
+          return;
+        }
+        setScans((prev) => ({
+          ...prev,
+          [root]: scan,
+        }));
+        setCachedRoots((prev) => {
+          return prev.includes(root) ? prev : [...prev, root];
+        });
+        setSelectedRoot((current) => (current === null ? root : current));
+        setScanUpdateCount((c) => c + 1);
+        debugLog(`DiskUsageView externalScanRoot loaded root=${root}`);
+      } catch (e) {
+        debugLog(
+          `DiskUsageView externalScanRoot error: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [externalScanRoot]);
 
   useEffect(() => {
     if (cachedRoots.length > 0 && selectedRoot === null) {
@@ -251,6 +288,8 @@ export const DiskUsageView = ({
   const cancelScan = () => {
     debugLog("DiskUsageView cancelScan");
     scanCancelRef.current = true;
+    setScanProgress(null);
+    setScanning(false);
   };
 
   const runScan = async () => {

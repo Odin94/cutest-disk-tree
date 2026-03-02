@@ -13,7 +13,10 @@ fn index_directory_finds_files_and_aggregates_folder_sizes() {
     let (files, folder_sizes) = index_directory(root);
 
     assert_eq!(files.len(), 3, "should find 3 files");
-    let paths: Vec<_> = files.iter().map(|(p, _, _)| p.clone()).collect();
+    let paths: Vec<String> = files
+        .iter()
+        .map(|f| f.path.to_string_lossy().to_string())
+        .collect();
     assert!(paths.iter().any(|p| p.ends_with("a.txt")));
     assert!(paths.iter().any(|p| p.ends_with("b.txt")));
     assert!(paths.iter().any(|p| p.ends_with("c.txt")));

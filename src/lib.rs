@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use walkdir::{DirEntry, WalkDir};
 use jwalk::WalkDir as JwalkDir;
 use serde::Serialize;
 use rayon::prelude::*;
+use ignore::WalkBuilder;
 
 pub mod db;
 
@@ -27,6 +30,29 @@ pub struct FileEntrySer {
     pub path: String,
     pub size: u64,
     pub file_key: FileKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum DiskObjectKind {
+    File,
+    Folder,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct DiskObject {
+    pub root: String,
+    pub path: String,
+    pub parent_path: Option<String>,
+    pub name: String,
+    pub ext: Option<String>,
+    pub kind: DiskObjectKind,
+    pub size: Option<u64>,
+    pub recursive_size: Option<u64>,
+    pub dev: Option<u64>,
+    pub ino: Option<u64>,
+    pub mtime: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,6 +69,18 @@ pub struct DiskTreeNode {
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub children: Option<Vec<DiskTreeNode>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum IndexMode {
+    Full,
+    Minimal,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IndexStats {
+    pub files: usize,
+    pub folders: usize,
 }
 
 fn path_separator(path: &str) -> char {
@@ -399,7 +437,7 @@ fn is_symlink(entry: &DirEntry) -> bool {
     entry.path_is_symlink()
 }
 
-fn path_ancestors(path: &Path) -> Vec<std::path::PathBuf> {
+fn path_ancestors(path: &Path) -> Vec<PathBuf> {
     let mut ancestors = Vec::new();
     let mut current = path.to_path_buf();
     while current.pop() {
@@ -410,7 +448,13 @@ fn path_ancestors(path: &Path) -> Vec<std::path::PathBuf> {
     ancestors
 }
 
-pub type FileEntry = (std::path::PathBuf, u64, FileKey);
+#[derive(Clone, Debug)]
+pub struct FileEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    pub file_key: FileKey,
+    pub mtime: Option<i64>,
+}
 
 const PROGRESS_INTERVAL: u64 = 200;
 
@@ -418,7 +462,26 @@ pub fn index_directory(root: &Path) -> (Vec<FileEntry>, HashMap<std::path::PathB
     index_directory_with_progress(root, |_| {})
 }
 
+pub fn index_directory_minimal(root: &Path) -> IndexStats {
+    let (_files, _folders, stats) =
+        index_directory_internal(root, &mut |_| {}, IndexMode::Minimal);
+    stats
+}
+
 pub fn index_directory_with_progress<F>(root: &Path, mut progress: F) -> (Vec<FileEntry>, HashMap<std::path::PathBuf, u64>)
+where
+    F: FnMut(ScanProgress),
+{
+    let (files, folder_sizes, _stats) =
+        index_directory_internal(root, &mut progress, IndexMode::Full);
+    (files, folder_sizes)
+}
+
+fn index_directory_internal<F>(
+    root: &Path,
+    progress: &mut F,
+    mode: IndexMode,
+) -> (Vec<FileEntry>, HashMap<std::path::PathBuf, u64>, IndexStats)
 where
     F: FnMut(ScanProgress),
 {
@@ -429,6 +492,8 @@ where
     });
 
     let mut files: Vec<FileEntry> = Vec::new();
+    let mut stats = IndexStats::default();
+
     let walker = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -436,38 +501,90 @@ where
 
     for entry in walker.filter_map(Result::ok) {
         let path = entry.path().to_path_buf();
-        if entry.file_type().is_file() {
-            if let Ok(meta) = entry.metadata() {
-                let size = meta.len();
-                if let Some(key) = file_key_from_path(&path) {
-                    files.push((path.clone(), size, key));
-                    if files.len() as u64 % PROGRESS_INTERVAL == 0 {
-                        progress(ScanProgress {
-                            files_count: files.len() as u64,
-                            current_path: Some(path.to_string_lossy().to_string()),
-                            status: None,
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            stats.folders += 1;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
+        match mode {
+            IndexMode::Full => {
+                if let Ok(meta) = entry.metadata() {
+                    let size = meta.len();
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
+                    if let Some(key) = file_key_from_path(&path) {
+                        files.push(FileEntry {
+                            path: path.clone(),
+                            size,
+                            file_key: key,
+                            mtime,
                         });
+                        if files.len() as u64 % PROGRESS_INTERVAL == 0 {
+                            progress(ScanProgress {
+                                files_count: files.len() as u64,
+                                current_path: Some(path.to_string_lossy().to_string()),
+                                status: None,
+                            });
+                        }
                     }
+                }
+            }
+            IndexMode::Minimal => {
+                stats.files += 1;
+                if stats.files as u64 % PROGRESS_INTERVAL == 0 {
+                    progress(ScanProgress {
+                        files_count: stats.files as u64,
+                        current_path: Some(path.to_string_lossy().to_string()),
+                        status: None,
+                    });
                 }
             }
         }
     }
 
-    progress(ScanProgress {
-        files_count: files.len() as u64,
-        current_path: None,
-        status: None,
-    });
+    match mode {
+        IndexMode::Full => {
+            progress(ScanProgress {
+                files_count: files.len() as u64,
+                current_path: None,
+                status: None,
+            });
 
-    progress(ScanProgress {
-        files_count: files.len() as u64,
-        current_path: None,
-        status: Some("Computing folder sizes…".into()),
-    });
+            progress(ScanProgress {
+                files_count: files.len() as u64,
+                current_path: None,
+                status: Some("Computing folder sizes…".into()),
+            });
 
-    let folder_sizes = aggregate_folder_sizes(root, &files);
+            let folder_sizes = aggregate_folder_sizes(root, &files);
+            let file_count = files.len();
 
-    (files, folder_sizes)
+            (
+                files,
+                folder_sizes,
+                IndexStats {
+                    files: file_count,
+                    folders: stats.folders,
+                },
+            )
+        }
+        IndexMode::Minimal => {
+            progress(ScanProgress {
+                files_count: stats.files as u64,
+                current_path: None,
+                status: None,
+            });
+
+            (Vec::new(), HashMap::new(), stats)
+        }
+    }
 }
 
 fn aggregate_folder_sizes(
@@ -477,19 +594,30 @@ fn aggregate_folder_sizes(
     let mut seen: HashSet<FileKey> = HashSet::new();
     let mut folder_sizes: HashMap<std::path::PathBuf, u64> = HashMap::new();
     let root_buf = root.to_path_buf();
-    for (path, size, key) in files {
-        if seen.contains(key) {
+    for entry in files {
+        if seen.contains(&entry.file_key) {
             continue;
         }
-        seen.insert(*key);
-        *folder_sizes.entry(root_buf.clone()).or_insert(0) += size;
-        for ancestor in path_ancestors(path) {
+        seen.insert(entry.file_key);
+        *folder_sizes.entry(root_buf.clone()).or_insert(0) += entry.size;
+        for ancestor in path_ancestors(&entry.path) {
             if ancestor != root_buf && ancestor.starts_with(root) {
-                *folder_sizes.entry(ancestor).or_insert(0) += size;
+                *folder_sizes.entry(ancestor).or_insert(0) += entry.size;
             }
         }
     }
     folder_sizes
+}
+
+/// High-level helper to compute recursive folder sizes from a flat file list.
+///
+/// This is a thin wrapper around the internal aggregation used by the app,
+/// exposed so that other crates (like the Tauri shell) can reuse the same logic.
+pub fn compute_folder_sizes(
+    root: &Path,
+    files: &[FileEntry],
+) -> HashMap<std::path::PathBuf, u64> {
+    aggregate_folder_sizes(root, files)
 }
 
 pub fn index_directory_parallel_with_progress<F>(
@@ -505,6 +633,45 @@ where
         status: Some("Scanning files…".into()),
     });
 
+    #[cfg(windows)]
+    {
+        if let Some((files, folder_sizes)) =
+            index_directory_ntfs_with_progress(root, &mut progress)
+        {
+            return (files, folder_sizes);
+        }
+        progress(ScanProgress {
+            files_count: 0,
+            current_path: None,
+            status: Some("Falling back to directory walk…".into()),
+        });
+    }
+
+    let (files, folder_sizes, _stats) =
+        index_directory_parallel_jwalk_internal(root, progress, IndexMode::Full);
+
+    (files, folder_sizes)
+}
+
+pub fn index_directory_parallel_minimal(root: &Path) -> IndexStats {
+    let (_files, _folders, stats) = index_directory_parallel_jwalk_internal(
+        root,
+        |_| {},
+        IndexMode::Minimal,
+    );
+    stats
+}
+
+fn index_directory_parallel_jwalk_internal<F>(
+    root: &Path,
+    mut progress: F,
+    mode: IndexMode,
+) -> (Vec<FileEntry>, HashMap<std::path::PathBuf, u64>, IndexStats)
+where
+    F: FnMut(ScanProgress),
+{
+    let mut stats = IndexStats::default();
+
     let mut files: Vec<FileEntry> = Vec::new();
     let walk = match JwalkDir::new(root).follow_links(false).try_into_iter() {
         Ok(w) => w,
@@ -514,31 +681,174 @@ where
                 current_path: None,
                 status: Some("Scan failed (try_into_iter)".into()),
             });
-            return (files, HashMap::new());
+            return (files, HashMap::new(), stats);
         }
     };
 
     for entry in walk.filter_map(Result::ok) {
-        if entry.path_is_symlink() || !entry.file_type().is_file() {
+        if entry.path_is_symlink() {
             continue;
         }
+        let file_type = entry.file_type();
         let path = entry.path();
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let size = meta.len();
-        let key = match file_key_from_path(&path) {
-            Some(k) => k,
-            None => continue,
-        };
-        files.push((path.clone(), size, key));
-        if files.len() as u64 % PROGRESS_INTERVAL == 0 {
+
+        if file_type.is_dir() {
+            stats.folders += 1;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
+        match mode {
+            IndexMode::Full => {
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let size = meta.len();
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
+                let key = match file_key_from_path(&path) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                files.push(FileEntry {
+                    path: path.clone(),
+                    size,
+                    file_key: key,
+                    mtime,
+                });
+                if files.len() as u64 % PROGRESS_INTERVAL == 0 {
+                    progress(ScanProgress {
+                        files_count: files.len() as u64,
+                        current_path: Some(path.to_string_lossy().to_string()),
+                        status: None,
+                    });
+                }
+            }
+            IndexMode::Minimal => {
+                stats.files += 1;
+                if stats.files as u64 % PROGRESS_INTERVAL == 0 {
+                    progress(ScanProgress {
+                        files_count: stats.files as u64,
+                        current_path: Some(path.to_string_lossy().to_string()),
+                        status: None,
+                    });
+                }
+            }
+        }
+    }
+
+    match mode {
+        IndexMode::Full => {
             progress(ScanProgress {
                 files_count: files.len() as u64,
-                current_path: Some(path.to_string_lossy().to_string()),
+                current_path: None,
                 status: None,
             });
+
+            progress(ScanProgress {
+                files_count: files.len() as u64,
+                current_path: None,
+                status: Some("Computing folder sizes…".into()),
+            });
+
+            let folder_sizes = aggregate_folder_sizes(root, &files);
+            let file_count = files.len();
+
+            (
+                files,
+                folder_sizes,
+                IndexStats {
+                    files: file_count,
+                    folders: stats.folders,
+                },
+            )
+        }
+        IndexMode::Minimal => {
+            progress(ScanProgress {
+                files_count: stats.files as u64,
+                current_path: None,
+                status: None,
+            });
+
+            (Vec::new(), HashMap::new(), stats)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn index_directory_ntfs_with_progress<F>(
+    root: &Path,
+    mut progress: F,
+) -> Option<(Vec<FileEntry>, HashMap<PathBuf, u64>)>
+where
+    F: FnMut(ScanProgress),
+{
+    use std::ffi::OsString;
+    use usn_journal_rs::{mft::Mft, volume::Volume};
+    use usn_journal_rs::path::PathResolvableEntry;
+
+    let root_str = root.to_string_lossy();
+    let drive_letter = root_str.chars().next().unwrap_or_default();
+    if !drive_letter.is_ascii_alphabetic() {
+        return None;
+    }
+
+    let volume = match Volume::from_drive_letter(drive_letter) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+
+    let mft = Mft::new(&volume);
+    let mut files: Vec<FileEntry> = Vec::new();
+
+    for entry_res in mft.iter() {
+        let entry = match entry_res {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.is_dir() {
+            continue;
+        }
+
+        // Best-effort path reconstruction: use file_name for now; a full
+        // PathResolver-based parent chain walk can be added later.
+        let name: &OsString = entry.file_name();
+        let name_str = name.to_string_lossy().to_string();
+
+        let candidate_path = PathBuf::from(format!("{}:\\{}", drive_letter, name_str));
+        let meta = std::fs::metadata(&candidate_path).ok();
+        let (size, mtime) = if let Some(m) = meta {
+            let sz = m.len();
+            let mt = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            (sz, mt)
+        } else {
+            (0, None)
+        };
+
+        if let Some(key) = file_key_from_path(&candidate_path) {
+            files.push(FileEntry {
+                path: candidate_path.clone(),
+                size,
+                file_key: key,
+                mtime,
+            });
+            if files.len() as u64 % PROGRESS_INTERVAL == 0 {
+                progress(ScanProgress {
+                    files_count: files.len() as u64,
+                    current_path: Some(candidate_path.to_string_lossy().to_string()),
+                    status: None,
+                });
+            }
         }
     }
 
@@ -556,7 +866,7 @@ where
 
     let folder_sizes = aggregate_folder_sizes(root, &files);
 
-    (files, folder_sizes)
+    Some((files, folder_sizes))
 }
 
 pub fn index_directory_serializable(root: &Path) -> Option<ScanResult> {
@@ -572,10 +882,11 @@ pub fn to_scan_result(
     let root_str = root.to_string_lossy().to_string();
     let files_ser: Vec<FileEntrySer> = files
         .iter()
-        .map(|(p, s, k)| FileEntrySer {
-            path: p.to_string_lossy().to_string(),
-            size: *s,
-            file_key: *k,
+        .map(|entry| FileEntrySer {
+            path: entry.path.to_string_lossy().to_string(),
+            size: entry.size,
+            file_key: entry.file_key,
+            mtime: entry.mtime,
         })
         .collect();
     let folder_sizes_ser: HashMap<String, u64> = folder_sizes
@@ -589,9 +900,240 @@ pub fn to_scan_result(
     })
 }
 
+pub fn index_directory_lolcate_like(root: &Path, _mode: IndexMode) -> IndexStats {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .parents(false)
+        .follow_links(false)
+        .ignore(true)
+        .git_global(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .threads(4);
+
+    let files = Arc::new(AtomicUsize::new(0));
+    let folders = Arc::new(AtomicUsize::new(0));
+
+    let walk = builder.build_parallel();
+    walk.run(|| {
+        let files = Arc::clone(&files);
+        let folders = Arc::clone(&folders);
+        Box::new(move |entry| {
+            use ignore::WalkState;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return WalkState::Continue,
+            };
+            if let Some(ft) = entry.file_type() {
+                if ft.is_symlink() {
+                    return WalkState::Continue;
+                }
+                if ft.is_dir() {
+                    folders.fetch_add(1, Ordering::Relaxed);
+                } else if ft.is_file() {
+                    files.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            WalkState::Continue
+        })
+    });
+
+    IndexStats {
+        files: files.load(Ordering::Relaxed),
+        folders: folders.load(Ordering::Relaxed),
+    }
+}
+
+/// Ignore-based parallel indexer used for the main application scan path.
+///
+/// Collects files with path, size and last-modified timestamp, and reports
+/// progress periodically. Folder sizes are computed separately.
+pub fn index_directory_ignore_with_progress<F>(root: &Path, progress: F) -> Vec<FileEntry>
+where
+    F: FnMut(ScanProgress) + Send,
+{
+    let progress = Arc::new(Mutex::new(progress));
+
+    {
+        let mut cb = progress.lock().unwrap();
+        cb(ScanProgress {
+            files_count: 0,
+            current_path: None,
+            status: Some("Scanning files…".into()),
+        });
+    }
+
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .parents(false)
+        .follow_links(false)
+        .ignore(true)
+        .git_global(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .threads(4);
+
+    let files_acc: Arc<Mutex<Vec<FileEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let walk = builder.build_parallel();
+    walk.run(|| {
+        let files_acc = Arc::clone(&files_acc);
+        let counter = Arc::clone(&counter);
+        let progress = Arc::clone(&progress);
+        Box::new(move |entry| {
+            use ignore::WalkState;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return WalkState::Continue,
+            };
+            let ft = match entry.file_type() {
+                Some(ft) => ft,
+                None => return WalkState::Continue,
+            };
+            if ft.is_symlink() {
+                return WalkState::Continue;
+            }
+            if !ft.is_file() {
+                return WalkState::Continue;
+            }
+
+            let path = entry.path().to_path_buf();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => return WalkState::Continue,
+            };
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            let key = match file_key_from_path(&path) {
+                Some(k) => k,
+                None => return WalkState::Continue,
+            };
+
+            {
+                let mut guard = files_acc.lock().unwrap();
+                guard.push(FileEntry {
+                    path: path.clone(),
+                    size,
+                    file_key: key,
+                    mtime,
+                });
+            }
+
+            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if n as u64 % PROGRESS_INTERVAL == 0 {
+                if let Ok(mut cb) = progress.lock() {
+                    cb(ScanProgress {
+                        files_count: n as u64,
+                        current_path: Some(path.to_string_lossy().to_string()),
+                        status: None,
+                    });
+                }
+            }
+
+            WalkState::Continue
+        })
+    });
+
+    let files = match Arc::try_unwrap(files_acc) {
+        Ok(mutex) => mutex.into_inner().unwrap(),
+        Err(arc) => arc.lock().unwrap().clone(),
+    };
+
+    if let Ok(mut cb) = progress.lock() {
+        cb(ScanProgress {
+            files_count: files.len() as u64,
+            current_path: None,
+            status: None,
+        });
+    }
+
+    files
+}
+
+pub fn index_directory_lolcate_full(
+    root: &Path,
+) -> (Vec<FileEntry>, HashMap<std::path::PathBuf, u64>) {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .parents(false)
+        .follow_links(false)
+        .ignore(true)
+        .git_global(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .threads(4);
+
+    let files_acc: Arc<Mutex<Vec<FileEntry>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let walk = builder.build_parallel();
+    walk.run(|| {
+        let files_acc = Arc::clone(&files_acc);
+        Box::new(move |entry| {
+            use ignore::WalkState;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return WalkState::Continue,
+            };
+            if let Some(ft) = entry.file_type() {
+                if ft.is_symlink() {
+                    return WalkState::Continue;
+                }
+                if !ft.is_file() {
+                    return WalkState::Continue;
+                }
+            } else {
+                return WalkState::Continue;
+            }
+
+            let path = entry.path();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => return WalkState::Continue,
+            };
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            let key = match file_key_from_path(&path) {
+                Some(k) => k,
+                None => return WalkState::Continue,
+            };
+
+            let mut guard = files_acc.lock().unwrap();
+            guard.push(FileEntry {
+                path: path.to_path_buf(),
+                size,
+                file_key: key,
+                mtime,
+            });
+
+            WalkState::Continue
+        })
+    });
+
+    let files = match Arc::try_unwrap(files_acc) {
+        Ok(mutex) => mutex.into_inner().unwrap(),
+        Err(arc) => arc.lock().unwrap().clone(),
+    };
+    let folder_sizes = aggregate_folder_sizes(root, &files);
+
+    (files, folder_sizes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     #[test]
@@ -601,5 +1143,60 @@ mod tests {
         assert!(a.iter().any(|x| *x == PathBuf::from("/a/b/c")));
         assert!(a.iter().any(|x| *x == PathBuf::from("/a/b")));
         assert!(a.iter().any(|x| *x == PathBuf::from("/a")));
+    }
+
+    #[test]
+    fn build_disk_tree_creates_expected_structure() {
+        // Construct a small synthetic ScanResult:
+        //
+        // /root
+        //   /root/sub
+        //     /root/sub/file1 (size 10)
+        //   /root/file2 (size 5)
+        let root = "/root".to_string();
+
+        let files_ser = vec![
+            FileEntrySer {
+                path: "/root/sub/file1".to_string(),
+                size: 10,
+                file_key: FileKey { dev: 1, ino: 1 },
+                mtime: None,
+            },
+            FileEntrySer {
+                path: "/root/file2".to_string(),
+                size: 5,
+                file_key: FileKey { dev: 1, ino: 2 },
+                mtime: None,
+            },
+        ];
+
+        let mut folder_sizes: HashMap<String, u64> = HashMap::new();
+        folder_sizes.insert("/root".to_string(), 15);
+        folder_sizes.insert("/root/sub".to_string(), 10);
+
+        let scan = ScanResult {
+            root: root.clone(),
+            files: files_ser,
+            folder_sizes,
+        };
+
+        let (tree_opt, _timings) = build_disk_tree_timed(&scan, 10, 10);
+        let tree = tree_opt.expect("tree should be built");
+
+        fn collect_paths(node: &DiskTreeNode, out: &mut Vec<(String, u64, bool)>) {
+            out.push((node.path.clone(), node.size, node.children.is_some()));
+            if let Some(children) = &node.children {
+                for child in children {
+                    collect_paths(child, out);
+                }
+            }
+        }
+
+        let mut all: Vec<(String, u64, bool)> = Vec::new();
+        collect_paths(&tree, &mut all);
+
+        // Root and subfolder sizes must match the synthetic folder_sizes map.
+        assert!(all.iter().any(|(p, s, _)| p == "/root" && *s == 15));
+        assert!(all.iter().any(|(p, s, _)| p == "/root/sub" && *s == 10));
     }
 }

@@ -4,6 +4,7 @@ export type FileEntry = {
   path: string;
   size: number;
   file_key: FileKey;
+  mtime?: number;
 };
 
 export type SearchItemKind = "file" | "folder";

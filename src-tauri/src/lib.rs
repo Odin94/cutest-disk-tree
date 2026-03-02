@@ -1,4 +1,4 @@
-use cutest_disk_tree::{db, index_directory_parallel_with_progress};
+use cutest_disk_tree::{db, DiskObject, DiskObjectKind};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -25,6 +25,7 @@ struct SearchEntry {
 struct AppState {
     db_path: std::path::PathBuf,
     debug_log: Mutex<Option<std::path::PathBuf>>,
+    disk_objects: Mutex<HashMap<String, Vec<DiskObject>>>,
     file_index: Mutex<HashMap<String, Vec<FileIndexEntry>>>,
     folder_index: Mutex<HashMap<String, Vec<(String, u64)>>>,
 }
@@ -32,6 +33,9 @@ struct AppState {
 #[derive(Clone)]
 struct FileIndexEntry {
     path: String,
+    name: String,
+    lower_name: String,
+    lower_path: String,
     size: u64,
     dev: u64,
     ino: u64,
@@ -124,27 +128,25 @@ async fn scan_directory(
     let db_path = state.db_path.clone();
     let path_for_db = path.clone();
 
-    let result = match tauri::async_runtime::spawn_blocking(move || {
-        let (files, folder_sizes) = index_directory_parallel_with_progress(&path_buf, |p| {
-            let _ = app.emit("scan-progress", &p);
-        });
-        let result = cutest_disk_tree::to_scan_result(&path_buf, &files, &folder_sizes)
-            .ok_or_else(|| "Indexing failed".to_string())?;
-        let _ = app.emit(
-            "scan-progress",
-            &cutest_disk_tree::ScanProgress {
-                files_count: files.len() as u64,
-                current_path: None,
-                status: Some("Saving to database…".into()),
-            },
-        );
-        let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
-        db::write_scan(&conn, &path_for_db, &files, &folder_sizes).map_err(|e| e.to_string())?;
-        Ok::<_, String>(result)
+    // Phase 1: fast in-memory scan using the ignore-based walker.
+    let root_for_scan = path_buf.clone();
+    let app_for_scan = app.clone();
+    let (result, files) = match tauri::async_runtime::spawn_blocking(move || {
+        let files =
+            cutest_disk_tree::index_directory_ignore_with_progress(&root_for_scan, |p| {
+                let _ = app_for_scan.emit("scan-progress", &p);
+            });
+        // For the immediate response, we don't include recursive folder sizes yet.
+        let empty_folder_sizes: std::collections::HashMap<std::path::PathBuf, u64> =
+            std::collections::HashMap::new();
+        let result =
+            cutest_disk_tree::to_scan_result(&root_for_scan, &files, &empty_folder_sizes)
+                .ok_or_else(|| "Indexing failed".to_string())?;
+        Ok::<_, String>((result, files))
     })
     .await
     {
-        Ok(Ok(r)) => r,
+        Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             write_debug_log(&state, &format!("error scan_directory: {}", e));
             return Err(e);
@@ -155,8 +157,115 @@ async fn scan_directory(
         }
     };
 
+    // Phase 1b: build active in-memory indexes for this root from the scan results.
+    {
+        let mut disk_map = state.disk_objects.lock().unwrap();
+        let mut file_map = state.file_index.lock().unwrap();
+        let mut folder_map = state.folder_index.lock().unwrap();
+
+        // Build DiskObjects for files only at this stage.
+        let disk_objs: Vec<DiskObject> = files
+            .iter()
+            .map(|f| {
+                let path_string = f.path.to_string_lossy().to_string();
+                let parent = cutest_disk_tree::parent_dir(&path_string);
+                let name = std::path::Path::new(&path_string)
+                    .file_name()
+                    .and_then(|os| os.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| path_string.clone());
+                let ext = std::path::Path::new(&path_string)
+                    .extension()
+                    .and_then(|os| os.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+                DiskObject {
+                    root: path.clone(),
+                    path: path_string.clone(),
+                    parent_path: if parent.is_empty() { None } else { Some(parent) },
+                    name: name.clone(),
+                    ext,
+                    kind: DiskObjectKind::File,
+                    size: Some(f.size),
+                    recursive_size: None,
+                    dev: Some(f.file_key.dev),
+                    ino: Some(f.file_key.ino),
+                    mtime: f.mtime,
+                }
+            })
+            .collect();
+        disk_map.insert(path.clone(), disk_objs.clone());
+
+        let entries: Vec<FileIndexEntry> = files
+            .iter()
+            .map(|f| {
+                let path_string = f.path.to_string_lossy().to_string();
+                let lower_path = path_string.to_lowercase();
+                let name = std::path::Path::new(&path_string)
+                    .file_name()
+                    .and_then(|os| os.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| path_string.clone());
+                let lower_name = name.to_ascii_lowercase();
+                FileIndexEntry {
+                    path: path_string,
+                    name,
+                    lower_name,
+                    lower_path,
+                    size: f.size,
+                    dev: f.file_key.dev,
+                    ino: f.file_key.ino,
+                    file_type: std::path::Path::new(&f.path)
+                        .extension()
+                        .and_then(|os| os.to_str())
+                        .map(|s| s.to_ascii_lowercase()),
+                }
+            })
+            .collect();
+
+        file_map.insert(path.clone(), entries);
+        // Initial folder index: empty; it will be updated with aggregated sizes in Phase 2.
+        folder_map.insert(path.clone(), Vec::new());
+    }
+
+    // Phase 2: in the background, compute recursive folder sizes, write everything to SQLite,
+    // and then swap the updated folder index into active memory.
+    {
+        let db_path_bg = db_path.clone();
+        let path_for_db_bg = path_for_db.clone();
+        let root_bg = path_buf.clone();
+        let files_bg = files.clone();
+        let app_bg = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let folder_sizes = cutest_disk_tree::compute_folder_sizes(&root_bg, &files_bg);
+
+            // Update in-memory folder index for this root.
+            {
+                let state_ptr: tauri::State<AppState> = app_bg.state();
+                let mut folder_map = state_ptr.folder_index.lock().unwrap();
+                let mut list: Vec<(String, u64)> = folder_sizes
+                    .iter()
+                    .map(|(p, s)| (p.to_string_lossy().to_string(), *s))
+                    .collect();
+                // Sort descending by size to roughly match previous DB-backed behaviour.
+                list.sort_by(|a, b| b.1.cmp(&a.1));
+                folder_map.insert(path_for_db_bg.clone(), list);
+            }
+
+            // Persist to SQLite in the background.
+            let conn = match db::open_db(&db_path_bg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("background db open failed: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = db::write_scan(&conn, &path_for_db_bg, &files_bg, &folder_sizes) {
+                eprintln!("background write_scan failed: {}", e);
+            }
+        });
+    }
+
     write_debug_log(&state, &format!("scan_directory done path={}", path));
-    clear_index_for_root(&state, &path);
     Ok(result)
 }
 
@@ -164,6 +273,77 @@ fn clear_index_for_root(state: &AppState, root: &str) {
     let _ = state.file_index.lock().unwrap().remove(root);
     let _ = state.folder_index.lock().unwrap().remove(root);
     write_debug_log(state, &format!("find_files index invalidated root={}", root));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_entry(path: &str) -> FileIndexEntry {
+        let path_string = path.to_string();
+        let lower_path = path_string.to_lowercase();
+        let name = std::path::Path::new(&path_string)
+            .file_name()
+            .and_then(|os| os.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| path_string.clone());
+        let lower_name = name.to_ascii_lowercase();
+        FileIndexEntry {
+            path: path_string,
+            name,
+            lower_name,
+            lower_path,
+            size: 0,
+            dev: 0,
+            ino: 0,
+            file_type: None,
+        }
+    }
+
+    #[test]
+    fn filename_substring_match_non_fuzzy_uses_basename() {
+        let entry = make_entry("C:/qt/qml/controls/AbstractButton.qml");
+        let rows: Vec<&FileIndexEntry> = vec![&entry];
+        let q = "button".to_string();
+
+        let filtered: Vec<&FileIndexEntry> = rows
+            .into_iter()
+            .filter(|e| e.lower_name.contains(&q))
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].path.ends_with("AbstractButton.qml"));
+    }
+
+    #[test]
+    fn filename_fuzzy_match_uses_basename_labels() {
+        let entry = make_entry("C:/qt/qml/controls/AbstractButton.qml");
+        let rows: Vec<&FileIndexEntry> = vec![&entry];
+        let q = "button".to_string();
+
+        let filtered: Vec<&FileIndexEntry> = rows
+            .into_iter()
+            .filter(|e| e.lower_name.contains(&q))
+            .collect();
+        assert_eq!(filtered.len(), 1);
+
+        let labels: Vec<&str> = filtered.iter().map(|e| e.name.as_str()).collect();
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let pattern =
+            Pattern::parse(&q, CaseMatching::Smart, Normalization::Smart);
+        let mut scored = pattern.match_list(labels.iter().copied(), &mut matcher);
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut results: Vec<String> = Vec::new();
+        for (label, _score) in scored.into_iter().take(10) {
+            if let Some(e) = filtered.iter().find(|e| e.name.as_str() == label) {
+                results.push(e.path.clone());
+            }
+        }
+
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|p| p.ends_with("AbstractButton.qml")));
+    }
 }
 
 #[tauri::command]
@@ -433,7 +613,7 @@ fn find_files(
         ),
     );
 
-    let log_err = |e: &dyn std::fmt::Display| {
+    let _log_err = |e: &dyn std::fmt::Display| {
         let s = e.to_string();
         write_debug_log(&state, &format!("error find_files: {}", s));
         s
@@ -445,36 +625,23 @@ fn find_files(
             let t = total_start.elapsed().as_millis();
             write_debug_log(
                 &state,
-                &format!("find_files index from_cache root={} count={} ms={}", root, entries.len(), t),
+                &format!(
+                    "find_files index from_cache root={} count={} ms={}", 
+                    root, 
+                    entries.len(), 
+                    t
+                ),
             );
             (entries.clone(), true)
         } else {
-            drop(guard);
-            let load_start = Instant::now();
-            let conn = db::open_db(&state.db_path).map_err(|e| log_err(&e))?;
-            let rows = db::get_file_index(&conn, &root).map_err(|e| log_err(&e))?;
-            let load_ms = load_start.elapsed().as_millis();
-            let entries: Vec<FileIndexEntry> = rows
-                .into_iter()
-                .map(|(path, size, dev, ino, file_type)| FileIndexEntry {
-                    path,
-                    size,
-                    dev,
-                    ino,
-                    file_type,
-                })
-                .collect();
-            let count = entries.len();
-            state
-                .file_index
-                .lock()
-                .unwrap()
-                .insert(root.clone(), entries.clone());
             write_debug_log(
                 &state,
-                &format!("find_files index loaded_from_db root={} count={} load_ms={}", root, count, load_ms),
+                &format!(
+                    "find_files no_active_index root={} (returning empty results)", 
+                    root
+                ),
             );
-            (entries, false)
+            return Ok(Vec::new());
         }
     };
 
@@ -549,82 +716,52 @@ fn find_files(
 
     if !use_fuzzy {
         let contains_start = Instant::now();
-        if q_len < 3 {
-            let filtered: Vec<&FileIndexEntry> = rows
-                .into_iter()
-                .filter(|e| e.path.to_lowercase().contains(&q))
-                .collect();
-            let contains_ms = contains_start.elapsed().as_millis();
-            write_debug_log(
-                &state,
-                &format!(
-                    "find_files substring_short_query count={} contains_ms={}",
-                    filtered.len(),
-                    contains_ms
-                ),
-            );
+        let filtered: Vec<&FileIndexEntry> = rows
+            .into_iter()
+            .filter(|e| e.lower_name.contains(&q))
+            .collect();
+        let contains_ms = contains_start.elapsed().as_millis();
+        write_debug_log(
+            &state,
+            &format!(
+                "find_files substring_no_fuzzy q_len={} count={} contains_ms={}",
+                q_len,
+                filtered.len(),
+                contains_ms
+            ),
+        );
 
-            let sort_start = Instant::now();
-            results = filtered
-                .iter()
-                .map(|e| SearchEntry {
-                    path: e.path.clone(),
-                    size: e.size,
-                    kind: "file".to_string(),
-                    file_key: Some(cutest_disk_tree::FileKey {
-                        dev: e.dev,
-                        ino: e.ino,
-                    }),
-                })
-                .collect();
-            results.sort_by(|a, b| a.path.cmp(&b.path));
-            let sort_ms = sort_start.elapsed().as_millis();
-            let total_ms = total_start.elapsed().as_millis();
-            write_debug_log(
-                &state,
-                &format!(
-                    "find_files substring_short_query_done q_len={} count={} sort_take_ms={} total_ms={}",
-                    q_len,
-                    results.len(),
-                    sort_ms,
-                    total_ms,
-                ),
-            );
-        } else {
-            let conn = db::open_db(&state.db_path).map_err(|e| log_err(&e))?;
-            let db_results = db::search_files_by_substring(
-                &conn,
-                &root,
-                &q,
-                extension_set.as_ref(),
-                limit,
-            )
-            .map_err(|e| log_err(&e))?;
-            let contains_ms = contains_start.elapsed().as_millis();
-            write_debug_log(
-                &state,
-                &format!(
-                    "find_files substring_index q_len={} count={} contains_ms={}",
-                    q_len,
-                    db_results.len(),
-                    contains_ms
-                ),
-            );
-            results = db_results
-                .into_iter()
-                .map(|(path, size, dev, ino, _ty)| SearchEntry {
-                    path,
-                    size,
-                    kind: "file".to_string(),
-                    file_key: Some(cutest_disk_tree::FileKey { dev, ino }),
-                })
-                .collect();
-        }
+        let sort_start = Instant::now();
+        results = filtered
+            .iter()
+            .map(|e| SearchEntry {
+                path: e.path.clone(),
+                size: e.size,
+                kind: "file".to_string(),
+                file_key: Some(cutest_disk_tree::FileKey {
+                    dev: e.dev,
+                    ino: e.ino,
+                }),
+            })
+            .collect();
+        results.sort_by(|a, b| a.path.cmp(&b.path));
+        let sort_ms = sort_start.elapsed().as_millis();
+        let total_ms = total_start.elapsed().as_millis();
+        write_debug_log(
+            &state,
+            &format!(
+                "find_files substring_no_fuzzy_done q_len={} count={} sort_take_ms={} total_ms={}",
+                q_len,
+                results.len(),
+                sort_ms,
+                total_ms,
+            ),
+        );
     } else {
         let contains_start = Instant::now();
         let filtered: Vec<&FileIndexEntry> = rows
             .into_iter()
-            .filter(|e| e.path.to_lowercase().contains(&q))
+            .filter(|e| e.lower_name.contains(&q))
             .collect();
         let contains_ms = contains_start.elapsed().as_millis();
         write_debug_log(
@@ -665,7 +802,7 @@ fn find_files(
             );
         } else {
             let nucleo_start = Instant::now();
-            let labels: Vec<&str> = filtered.iter().map(|e| e.path.as_str()).collect();
+            let labels: Vec<&str> = filtered.iter().map(|e| e.name.as_str()).collect();
             let mut matcher = Matcher::new(Config::DEFAULT);
             let pattern =
                 Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart);
@@ -682,7 +819,7 @@ fn find_files(
             );
 
             for (label, _score) in scored.into_iter().take(limit) {
-                if let Some(e) = filtered.iter().find(|e| e.path.as_str() == label) {
+                if let Some(e) = filtered.iter().find(|e| e.name.as_str() == label) {
                     results.push(SearchEntry {
                         path: e.path.clone(),
                         size: e.size,
@@ -700,18 +837,27 @@ fn find_files(
     let folders_start = Instant::now();
     let folder_list = {
         let guard = state.folder_index.lock().unwrap();
-        if let Some(list) = guard.get(&root) {
-            list.clone()
-        } else {
-            drop(guard);
-            let conn = db::open_db(&state.db_path).map_err(|e| log_err(&e))?;
-            let list = db::get_folders_for_root(&conn, &root).map_err(|e| log_err(&e))?;
-            state.folder_index.lock().unwrap().insert(root.clone(), list.clone());
-            list
+        match guard.get(&root) {
+            Some(list) => list.clone(),
+            None => {
+                write_debug_log(
+                    &state,
+                    &format!(
+                        "find_files no_active_folder_index root={} (skipping folder matches)", 
+                        root
+                    ),
+                );
+                Vec::new()
+            }
         }
     };
     for (path, recursive_size) in folder_list.into_iter() {
-        if path.to_lowercase().contains(&q) {
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|os| os.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| path.to_lowercase());
+        if name.contains(&q) {
             results.push(SearchEntry {
                 path,
                 size: recursive_size,
@@ -781,11 +927,55 @@ pub fn run() {
                     f.flush()
                 });
 
+            // Preload active memory from SQLite if prior indexes exist.
+            let mut disk_objects_map: HashMap<String, Vec<DiskObject>> = HashMap::new();
+            let mut file_index_map: HashMap<String, Vec<FileIndexEntry>> = HashMap::new();
+            let mut folder_index_map: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+
+            let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
+            let roots = db::list_roots(&conn).map_err(|e| e.to_string())?;
+            for root in roots {
+                let objs = db::get_disk_objects_for_root(&conn, &root).unwrap_or_default();
+                let mut files_vec: Vec<FileIndexEntry> = Vec::new();
+                let mut folders_vec: Vec<(String, u64)> = Vec::new();
+                for o in &objs {
+                    match o.kind {
+                        DiskObjectKind::File => {
+                            let path_string = o.path.clone();
+                            let lower_path = path_string.to_lowercase();
+                            let name = o.name.clone();
+                            let lower_name = name.to_ascii_lowercase();
+                            files_vec.push(FileIndexEntry {
+                                path: path_string,
+                                name,
+                                lower_name,
+                                lower_path,
+                                size: o.size.unwrap_or(0),
+                                dev: o.dev.unwrap_or(0),
+                                ino: o.ino.unwrap_or(0),
+                                file_type: o.ext.clone(),
+                            });
+                        }
+                        DiskObjectKind::Folder => {
+                            if let Some(rs) = o.recursive_size {
+                                folders_vec.push((o.path.clone(), rs));
+                            }
+                        }
+                    }
+                }
+                disk_objects_map.insert(root.clone(), objs);
+                file_index_map.insert(root.clone(), files_vec);
+                // Sort folder list descending by size to match previous behaviour.
+                folders_vec.sort_by(|a, b| b.1.cmp(&a.1));
+                folder_index_map.insert(root.clone(), folders_vec);
+            }
+
             app.manage(AppState {
                 db_path,
                 debug_log: Mutex::new(Some(debug_log_path)),
-                file_index: Mutex::new(HashMap::new()),
-                folder_index: Mutex::new(HashMap::new()),
+                disk_objects: Mutex::new(disk_objects_map),
+                file_index: Mutex::new(file_index_map),
+                folder_index: Mutex::new(folder_index_map),
             });
             Ok(())
         })

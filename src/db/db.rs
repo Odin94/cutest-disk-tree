@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::FileKey;
+use crate::{FileEntry, FileKey};
 use crate::DiskTreeNode;
 use crate::parent_dir;
 use super::migrations::migrations;
@@ -15,7 +15,7 @@ pub struct GetScanTimings {
     pub folders_query_ms: u64,
 }
 
-const BATCH_SIZE: usize = 200;
+const BATCH_SIZE: usize = 1000;
 
 fn make_trigrams(s: &str) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
@@ -33,7 +33,7 @@ fn make_trigrams(s: &str) -> Vec<String> {
 pub fn write_scan(
     conn: &Connection,
     root: &str,
-    files: &[(std::path::PathBuf, u64, FileKey)],
+    files: &[FileEntry],
     folder_sizes: &std::collections::HashMap<std::path::PathBuf, u64>,
 ) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
@@ -42,59 +42,87 @@ pub fn write_scan(
     tx.execute("DELETE FROM folders WHERE root = ?1", [root])?;
     tx.execute("DELETE FROM cached_trees WHERE root = ?1", [root])?;
     tx.execute("DELETE FROM file_search_trigrams WHERE root = ?1", [root])?;
+    tx.execute("DELETE FROM items WHERE root = ?1", [root])?;
 
-    {
-        let mut trigram_stmt = tx.prepare(
-            "INSERT OR IGNORE INTO file_search_trigrams (root, path, trigram) VALUES (?1, ?2, ?3)",
-        )?;
+    for chunk in files.chunks(BATCH_SIZE) {
+        let row_placeholders = (0..chunk.len())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO files (root, path, size, dev, ino, hash, mtime, name, type, parent_path) VALUES {}",
+            row_placeholders
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> =
+            Vec::with_capacity(chunk.len() * 10);
+        for entry in chunk {
+            let path_str = entry.path.to_string_lossy().to_string();
+            let parent_path = parent_dir(&path_str);
+            let name: Option<String> = entry
+                .path
+                .file_name()
+                .and_then(|os| os.to_str())
+                .map(|s| s.to_string());
+            let file_type: Option<String> = entry
+                .path
+                .extension()
+                .and_then(|os| os.to_str())
+                .map(|s| s.to_ascii_lowercase());
 
-        for chunk in files.chunks(BATCH_SIZE) {
-            let row_placeholders = (0..chunk.len())
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "INSERT INTO files (root, path, size, dev, ino, hash, mtime, name, type, parent_path) VALUES {}",
-                row_placeholders
-            );
-            let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> =
-                Vec::with_capacity(chunk.len() * 10);
-            let mut paths_for_index: Vec<String> = Vec::with_capacity(chunk.len());
-            for (path, size, key) in chunk {
-                let path_str = path.to_string_lossy().to_string();
-                paths_for_index.push(path_str.clone());
-                let parent_path = parent_dir(&path_str);
-                let name: Option<String> = path
-                    .file_name()
-                    .and_then(|os| os.to_str())
-                    .map(|s| s.to_string());
-                let file_type: Option<String> = path
-                    .extension()
-                    .and_then(|os| os.to_str())
-                    .map(|s| s.to_ascii_lowercase());
-
-                params.push(Box::new(root));
-                params.push(Box::new(path_str));
-                params.push(Box::new(*size as i64));
-                params.push(Box::new(key.dev as i64));
-                params.push(Box::new(key.ino as i64));
-                params.push(Box::new(None::<String>));
-                params.push(Box::new(None::<i64>));
-                params.push(Box::new(name));
-                params.push(Box::new(file_type));
-                params.push(Box::new(parent_path));
-            }
-            let param_refs: Vec<&dyn rusqlite::ToSql> =
-                params.iter().map(|b| b.as_ref()).collect();
-            tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
-
-            for path_str in paths_for_index {
-                let normalized = path_str.to_lowercase();
-                for trigram in make_trigrams(&normalized) {
-                    trigram_stmt.execute(rusqlite::params![root, &path_str, trigram])?;
-                }
-            }
+            params.push(Box::new(root));
+            params.push(Box::new(path_str));
+            params.push(Box::new(entry.size as i64));
+            params.push(Box::new(entry.file_key.dev as i64));
+            params.push(Box::new(entry.file_key.ino as i64));
+            params.push(Box::new(None::<String>));
+            params.push(Box::new(entry.mtime.unwrap_or(0)));
+            params.push(Box::new(name));
+            params.push(Box::new(file_type));
+            params.push(Box::new(parent_path));
         }
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|b| b.as_ref()).collect();
+        tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
+
+        let row_placeholders_items = (0..chunk.len())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql_items = format!(
+            "INSERT INTO items (root, path, parent_path, name, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
+            row_placeholders_items
+        );
+        let mut item_params: Vec<Box<dyn rusqlite::ToSql + '_>> =
+            Vec::with_capacity(chunk.len() * 11);
+        for entry in chunk {
+            let path_str = entry.path.to_string_lossy().to_string();
+            let parent_path = parent_dir(&path_str);
+            let name: Option<String> = entry
+                .path
+                .file_name()
+                .and_then(|os| os.to_str())
+                .map(|s| s.to_string());
+            let ext: Option<String> = entry
+                .path
+                .extension()
+                .and_then(|os| os.to_str())
+                .map(|s| s.to_ascii_lowercase());
+
+            item_params.push(Box::new(root));
+            item_params.push(Box::new(path_str));
+            item_params.push(Box::new(parent_path));
+            item_params.push(Box::new(name));
+            item_params.push(Box::new(ext));
+            item_params.push(Box::new("file"));
+            item_params.push(Box::new(entry.size as i64));
+            item_params.push(Box::new(None::<i64>));
+            item_params.push(Box::new(entry.file_key.dev as i64));
+            item_params.push(Box::new(entry.file_key.ino as i64));
+            item_params.push(Box::new(entry.mtime.unwrap_or(0)));
+        }
+        let item_param_refs: Vec<&dyn rusqlite::ToSql> =
+            item_params.iter().map(|b| b.as_ref()).collect();
+        tx.execute(&sql_items, rusqlite::params_from_iter(item_param_refs))?;
     }
 
     let folder_vec: Vec<_> = folder_sizes.iter().collect();
@@ -115,6 +143,40 @@ pub fn write_scan(
         }
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
         tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
+
+        // Also populate unified items table for folders
+        let row_placeholders_items = (0..chunk.len())
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql_items = format!(
+            "INSERT INTO items (root, path, parent_path, name, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
+            row_placeholders_items
+        );
+        let mut item_params: Vec<Box<dyn rusqlite::ToSql + '_>> =
+            Vec::with_capacity(chunk.len() * 11);
+        for (path, size) in chunk.iter() {
+            let path_str = path.to_string_lossy().to_string();
+            let parent_path = parent_dir(&path_str);
+            let name = path
+                .file_name()
+                .and_then(|os| os.to_str())
+                .map(|s| s.to_string());
+            item_params.push(Box::new(root));
+            item_params.push(Box::new(path_str));
+            item_params.push(Box::new(parent_path));
+            item_params.push(Box::new(name));
+            item_params.push(Box::new(None::<String>));
+            item_params.push(Box::new("folder"));
+            item_params.push(Box::new(None::<i64>));
+            item_params.push(Box::new(**size as i64));
+            item_params.push(Box::new(None::<i64>));
+            item_params.push(Box::new(None::<i64>));
+            item_params.push(Box::new(None::<i64>));
+        }
+        let item_param_refs: Vec<&dyn rusqlite::ToSql> =
+            item_params.iter().map(|b| b.as_ref()).collect();
+        tx.execute(&sql_items, rusqlite::params_from_iter(item_param_refs))?;
     }
 
     tx.commit()?;
@@ -142,6 +204,42 @@ pub fn get_file_index(
             row.get::<_, i64>(3)? as u64,
             row.get::<_, Option<String>>(4)?,
         ))
+    })?;
+    rows.collect()
+}
+
+pub fn get_disk_objects_for_root(
+    conn: &Connection,
+    root: &str,
+) -> rusqlite::Result<Vec<crate::DiskObject>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, parent_path, name, ext, kind, size, recursive_size, dev, ino, mtime \
+         FROM items WHERE root = ?1",
+    )?;
+    let rows = stmt.query_map([root], |row| {
+        let kind_str: String = row.get(4)?;
+        let kind = match kind_str.as_str() {
+            "folder" => crate::DiskObjectKind::Folder,
+            _ => crate::DiskObjectKind::File,
+        };
+        let size_opt: Option<i64> = row.get(5)?;
+        let rec_opt: Option<i64> = row.get(6)?;
+        let dev_opt: Option<i64> = row.get(7)?;
+        let ino_opt: Option<i64> = row.get(8)?;
+        let mtime_opt: Option<i64> = row.get(9)?;
+        Ok(crate::DiskObject {
+            root: root.to_string(),
+            path: row.get::<_, String>(0)?,
+            parent_path: row.get::<_, Option<String>>(1)?,
+            name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ext: row.get::<_, Option<String>>(3)?,
+            kind,
+            size: size_opt.map(|n| n as u64),
+            recursive_size: rec_opt.map(|n| n as u64),
+            dev: dev_opt.map(|n| n as u64),
+            ino: ino_opt.map(|n| n as u64),
+            mtime: mtime_opt,
+        })
     })?;
     rows.collect()
 }
@@ -275,7 +373,7 @@ pub fn get_scan_result_timed(
 
     let t0 = Instant::now();
     let mut file_stmt = conn.prepare(
-        "SELECT path, size, dev, ino FROM files WHERE root = ?1 ORDER BY path",
+        "SELECT path, size, dev, ino, mtime FROM files WHERE root = ?1 ORDER BY path",
     )?;
     let files: Vec<crate::FileEntrySer> = file_stmt
         .query_map([root], |row| {
@@ -286,6 +384,7 @@ pub fn get_scan_result_timed(
                     dev: row.get::<_, i64>(2)? as u64,
                     ino: row.get::<_, i64>(3)? as u64,
                 },
+                mtime: row.get::<_, Option<i64>>(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -412,9 +511,24 @@ pub fn get_root_size(conn: &Connection, root: &str) -> rusqlite::Result<Option<u
 }
 
 pub fn open_db(db_path: &Path) -> rusqlite::Result<Connection> {
+    use std::time::Duration;
+
     let mut conn = Connection::open(db_path)?;
-    migrations()
-        .to_latest(&mut conn)
-        .map_err(|_e| rusqlite::Error::ExecuteReturnedResults)?;
+
+    // Apply pending schema migrations. If this fails due to an underlying
+    // rusqlite error (e.g. "database is locked"), propagate that exact error
+    // instead of masking it as ExecuteReturnedResults.
+    if let Err(e) = migrations().to_latest(&mut conn) {
+        return match e {
+            rusqlite_migration::Error::RusqliteError { err, .. } => Err(err),
+            other => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(other))),
+        };
+    }
+
+    // Make concurrent access more robust in the face of background writers.
+    // busy_timeout allows SQLite to wait for a short period instead of
+    // immediately returning "database is locked".
+    conn.busy_timeout(Duration::from_millis(5000))?;
+
     Ok(conn)
 }

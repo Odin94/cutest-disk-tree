@@ -114,6 +114,13 @@ const App = () => {
   const cancelScan = () => {
     debugLog("App cancelScan");
     scanCancelRef.current = true;
+    if (unlistenRef.current) {
+      unlistenRef.current();
+      unlistenRef.current = null;
+    }
+    setLoading(false);
+    setProgress(null);
+    setScanRootPath(null);
   };
 
   const handleSelectCachedRoot = async (root: string) => {
@@ -167,7 +174,7 @@ const App = () => {
           className="view view-disk-usage"
           style={{ display: category === "disk" ? "block" : "none" }}
         >
-          <DiskUsageView />
+          <DiskUsageView externalScanRoot={result ? result.root : null} />
         </div>
         <div
           className="view view-file-finding"

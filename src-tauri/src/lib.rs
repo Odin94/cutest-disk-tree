@@ -1,5 +1,5 @@
 use cutest_disk_tree::{db, DiskObject, DiskObjectKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::process;
@@ -28,6 +28,116 @@ struct AppState {
     disk_objects: Mutex<HashMap<String, Vec<DiskObject>>>,
     file_index: Mutex<HashMap<String, Vec<FileIndexEntry>>>,
     folder_index: Mutex<HashMap<String, Vec<(String, u64)>>>,
+    name_reverse_index: Mutex<HashMap<String, NameReverseIndex>>,
+}
+
+fn make_trigrams(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() < 3 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(chars.len().saturating_sub(2));
+    for i in 0..(chars.len() - 2) {
+        out.push(chars[i..i + 3].iter().collect());
+    }
+    out
+}
+
+fn make_bigrams(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(chars.len().saturating_sub(1));
+    for i in 0..(chars.len() - 1) {
+        out.push(chars[i..i + 2].iter().collect());
+    }
+    out
+}
+
+fn make_unigrams(s: &str) -> Vec<String> {
+    s.chars().map(|c| c.to_string()).collect()
+}
+
+struct NameReverseIndex {
+    trigram_to_indices: HashMap<String, HashSet<usize>>,
+    bigram_to_indices: HashMap<String, HashSet<usize>>,
+    unigram_to_indices: HashMap<String, HashSet<usize>>,
+}
+
+fn build_name_reverse_index(entries: &[FileIndexEntry]) -> NameReverseIndex {
+    let mut trigram_to_indices: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut bigram_to_indices: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut unigram_to_indices: HashMap<String, HashSet<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        let s = &e.lower_name;
+        for t in make_trigrams(s) {
+            trigram_to_indices.entry(t).or_default().insert(i);
+        }
+        for b in make_bigrams(s) {
+            bigram_to_indices.entry(b).or_default().insert(i);
+        }
+        for u in make_unigrams(s) {
+            unigram_to_indices.entry(u).or_default().insert(i);
+        }
+    }
+    NameReverseIndex {
+        trigram_to_indices,
+        bigram_to_indices,
+        unigram_to_indices,
+    }
+}
+
+fn candidate_indices_from_reverse_index(
+    index: &NameReverseIndex,
+    q_lower: &str,
+) -> Option<HashSet<usize>> {
+    let chars_count = q_lower.chars().count();
+    let tokens: Vec<String> = if chars_count >= 3 {
+        make_trigrams(q_lower)
+    } else if chars_count >= 2 {
+        make_bigrams(q_lower)
+    } else if chars_count >= 1 {
+        make_unigrams(q_lower)
+    } else {
+        return None;
+    };
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut candidate_set: Option<HashSet<usize>> = None;
+    let map = if chars_count >= 3 {
+        &index.trigram_to_indices
+    } else if chars_count >= 2 {
+        &index.bigram_to_indices
+    } else {
+        &index.unigram_to_indices
+    };
+    for t in &tokens {
+        let set = map.get(t)?;
+        candidate_set = Some(match candidate_set {
+            Some(acc) => acc.intersection(set).copied().collect(),
+            None => set.clone(),
+        });
+        if candidate_set.as_ref().map_or(true, |s| s.is_empty()) {
+            return candidate_set;
+        }
+    }
+    candidate_set
+}
+
+fn extension_matches(
+    e: &FileIndexEntry,
+    extension_set: &Option<std::collections::HashSet<String>>,
+) -> bool {
+    match extension_set {
+        None => true,
+        Some(set) => e
+            .file_type
+            .as_ref()
+            .map(|t| set.contains(t))
+            .unwrap_or(false),
+    }
 }
 
 #[derive(Clone)]
@@ -222,7 +332,10 @@ async fn scan_directory(
             })
             .collect();
 
+        let name_index = build_name_reverse_index(&entries);
         file_map.insert(path.clone(), entries);
+        let mut rev_map = state.name_reverse_index.lock().unwrap();
+        rev_map.insert(path.clone(), name_index);
         // Initial folder index: empty; it will be updated with aggregated sizes in Phase 2.
         folder_map.insert(path.clone(), Vec::new());
     }
@@ -272,6 +385,7 @@ async fn scan_directory(
 fn clear_index_for_root(state: &AppState, root: &str) {
     let _ = state.file_index.lock().unwrap().remove(root);
     let _ = state.folder_index.lock().unwrap().remove(root);
+    let _ = state.name_reverse_index.lock().unwrap().remove(root);
     write_debug_log(state, &format!("find_files index invalidated root={}", root));
 }
 
@@ -712,25 +826,44 @@ fn find_files(
     let q = q_trimmed.to_lowercase();
     let q_len = q_trimmed.chars().count();
 
+    let candidate_set_opt = {
+        let guard = state.name_reverse_index.lock().unwrap();
+        guard
+            .get(&root)
+            .and_then(|idx| candidate_indices_from_reverse_index(idx, &q))
+    };
+
+    let contains_start = Instant::now();
+    let filtered: Vec<&FileIndexEntry> = match &candidate_set_opt {
+        Some(cs) => file_entries
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| {
+                cs.contains(i)
+                    && extension_matches(e, &extension_set)
+                    && e.lower_name.contains(&q)
+            })
+            .map(|(_, e)| e)
+            .collect(),
+        None => file_entries
+            .iter()
+            .filter(|e| extension_matches(e, &extension_set) && e.lower_name.contains(&q))
+            .collect(),
+    };
+    let contains_ms = contains_start.elapsed().as_millis();
+    write_debug_log(
+        &state,
+        &format!(
+            "find_files reverse_index candidates={} filtered={} contains_ms={}",
+            candidate_set_opt.as_ref().map(|s| s.len()).unwrap_or(0),
+            filtered.len(),
+            contains_ms
+        ),
+    );
+
     let mut results: Vec<SearchEntry> = Vec::new();
 
     if !use_fuzzy {
-        let contains_start = Instant::now();
-        let filtered: Vec<&FileIndexEntry> = rows
-            .into_iter()
-            .filter(|e| e.lower_name.contains(&q))
-            .collect();
-        let contains_ms = contains_start.elapsed().as_millis();
-        write_debug_log(
-            &state,
-            &format!(
-                "find_files substring_no_fuzzy q_len={} count={} contains_ms={}",
-                q_len,
-                filtered.len(),
-                contains_ms
-            ),
-        );
-
         let sort_start = Instant::now();
         results = filtered
             .iter()
@@ -758,21 +891,6 @@ fn find_files(
             ),
         );
     } else {
-        let contains_start = Instant::now();
-        let filtered: Vec<&FileIndexEntry> = rows
-            .into_iter()
-            .filter(|e| e.lower_name.contains(&q))
-            .collect();
-        let contains_ms = contains_start.elapsed().as_millis();
-        write_debug_log(
-            &state,
-            &format!(
-                "find_files after_contains count={} contains_ms={}",
-                filtered.len(),
-                contains_ms
-            ),
-        );
-
         if q_len < 3 {
             let sort_start = Instant::now();
             results = filtered
@@ -793,7 +911,7 @@ fn find_files(
             write_debug_log(
                 &state,
                 &format!(
-                    "find_files short_query_no_fuzzy q_len={} count={} sort_take_ms={} total_ms={}",
+                    "find_files short_query_fuzzy q_len={} count={} sort_take_ms={} total_ms={}",
                     q_len,
                     results.len(),
                     sort_ms,
@@ -931,6 +1049,7 @@ pub fn run() {
             let mut disk_objects_map: HashMap<String, Vec<DiskObject>> = HashMap::new();
             let mut file_index_map: HashMap<String, Vec<FileIndexEntry>> = HashMap::new();
             let mut folder_index_map: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+            let mut name_reverse_index_map: HashMap<String, NameReverseIndex> = HashMap::new();
 
             let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
             let roots = db::list_roots(&conn).map_err(|e| e.to_string())?;
@@ -964,7 +1083,8 @@ pub fn run() {
                     }
                 }
                 disk_objects_map.insert(root.clone(), objs);
-                file_index_map.insert(root.clone(), files_vec);
+                file_index_map.insert(root.clone(), files_vec.clone());
+                name_reverse_index_map.insert(root.clone(), build_name_reverse_index(&files_vec));
                 // Sort folder list descending by size to match previous behaviour.
                 folders_vec.sort_by(|a, b| b.1.cmp(&a.1));
                 folder_index_map.insert(root.clone(), folders_vec);
@@ -976,6 +1096,7 @@ pub fn run() {
                 disk_objects: Mutex::new(disk_objects_map),
                 file_index: Mutex::new(file_index_map),
                 folder_index: Mutex::new(folder_index_map),
+                name_reverse_index: Mutex::new(name_reverse_index_map),
             });
             Ok(())
         })

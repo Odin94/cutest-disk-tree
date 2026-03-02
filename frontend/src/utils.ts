@@ -15,3 +15,33 @@ export const basename = (path: string): string => {
   const parts = path.split(sep);
   return parts[parts.length - 1] ?? path;
 };
+
+export const progressTopLevelFolder = (
+  rootPath: string | null,
+  currentPath: string | null | undefined
+): string | null => {
+  if (rootPath === null || rootPath.length === 0) {
+    return null;
+  }
+  if (currentPath == null || currentPath.length === 0) {
+    return basename(rootPath);
+  }
+  const sep = rootPath.includes("\\") ? "\\" : "/";
+  const normalizedRoot = rootPath.endsWith(sep)
+    ? rootPath.slice(0, -1)
+    : rootPath;
+  const normalizedCurrent = currentPath.replace(/[\\/]+/g, sep);
+  let relative = normalizedCurrent;
+  if (normalizedCurrent.startsWith(normalizedRoot + sep)) {
+    relative = normalizedCurrent.slice(normalizedRoot.length + sep.length);
+  }
+  if (relative.length === 0) {
+    return basename(rootPath);
+  }
+  const firstSepIndex = relative.indexOf(sep);
+  if (firstSepIndex === -1) {
+    return relative;
+  }
+  return relative.slice(0, firstSepIndex);
+};
+

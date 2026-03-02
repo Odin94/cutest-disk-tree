@@ -30,10 +30,35 @@ ALTER TABLE files ADD COLUMN type TEXT;
 ALTER TABLE folders ADD COLUMN name TEXT;
 "#;
 
+pub const MIGRATION_3_CACHED_TREES: &str = r#"
+CREATE TABLE IF NOT EXISTS cached_trees (
+    root TEXT NOT NULL,
+    max_depth INTEGER NOT NULL,
+    max_children INTEGER NOT NULL,
+    tree_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (root, max_depth, max_children)
+);
+"#;
+
+pub const MIGRATION_4_PARENT_PATH: &str = r#"
+ALTER TABLE files ADD COLUMN parent_path TEXT;
+ALTER TABLE folders ADD COLUMN parent_path TEXT;
+CREATE INDEX IF NOT EXISTS idx_files_root_parent ON files(root, parent_path);
+CREATE INDEX IF NOT EXISTS idx_folders_root_parent ON folders(root, parent_path);
+"#;
+
+pub const MIGRATION_5_CLEAR_CACHED_TREES_OTHER_FIX: &str = r#"
+DELETE FROM cached_trees;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_1_INITIAL_SCHEMA),
         M::up(MIGRATION_2_ADD_NAMES_AND_TYPES),
+        M::up(MIGRATION_3_CACHED_TREES),
+        M::up(MIGRATION_4_PARENT_PATH),
+        M::up(MIGRATION_5_CLEAR_CACHED_TREES_OTHER_FIX),
     ])
 }
 

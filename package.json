@@ -10,6 +10,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@nivo/core": "^0.99.0",
+    "@nivo/sunburst": "^0.99.0",
     "@tailwindcss/postcss": "^4.2.1",
     "@tailwindcss/vite": "^4.2.1",
     "@tauri-apps/api": "^2",

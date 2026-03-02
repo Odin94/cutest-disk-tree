@@ -44,3 +44,6 @@ coverage/
 .tauri-public-key.decoded
 
 test-data/
+
+TODOs.md
+

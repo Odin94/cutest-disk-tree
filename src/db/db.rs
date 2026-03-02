@@ -1,5 +1,6 @@
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
@@ -16,6 +17,19 @@ pub struct GetScanTimings {
 
 const BATCH_SIZE: usize = 200;
 
+fn make_trigrams(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() < 3 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(chars.len().saturating_sub(2));
+    for i in 0..(chars.len() - 2) {
+        let trigram: String = chars[i..i + 3].iter().collect();
+        out.push(trigram);
+    }
+    out
+}
+
 pub fn write_scan(
     conn: &Connection,
     root: &str,
@@ -27,42 +41,60 @@ pub fn write_scan(
     tx.execute("DELETE FROM files WHERE root = ?1", [root])?;
     tx.execute("DELETE FROM folders WHERE root = ?1", [root])?;
     tx.execute("DELETE FROM cached_trees WHERE root = ?1", [root])?;
+    tx.execute("DELETE FROM file_search_trigrams WHERE root = ?1", [root])?;
 
-    for chunk in files.chunks(BATCH_SIZE) {
-        let row_placeholders = (0..chunk.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO files (root, path, size, dev, ino, hash, mtime, name, type, parent_path) VALUES {}",
-            row_placeholders
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> = Vec::with_capacity(chunk.len() * 10);
-        for (path, size, key) in chunk {
-            let path_str = path.to_string_lossy().to_string();
-            let parent_path = parent_dir(&path_str);
-            let name: Option<String> = path
-                .file_name()
-                .and_then(|os| os.to_str())
-                .map(|s| s.to_string());
-            let file_type: Option<String> = path
-                .extension()
-                .and_then(|os| os.to_str())
-                .map(|s| s.to_ascii_lowercase());
+    {
+        let mut trigram_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO file_search_trigrams (root, path, trigram) VALUES (?1, ?2, ?3)",
+        )?;
 
-            params.push(Box::new(root));
-            params.push(Box::new(path_str));
-            params.push(Box::new(*size as i64));
-            params.push(Box::new(key.dev as i64));
-            params.push(Box::new(key.ino as i64));
-            params.push(Box::new(None::<String>));
-            params.push(Box::new(None::<i64>));
-            params.push(Box::new(name));
-            params.push(Box::new(file_type));
-            params.push(Box::new(parent_path));
+        for chunk in files.chunks(BATCH_SIZE) {
+            let row_placeholders = (0..chunk.len())
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO files (root, path, size, dev, ino, hash, mtime, name, type, parent_path) VALUES {}",
+                row_placeholders
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> =
+                Vec::with_capacity(chunk.len() * 10);
+            let mut paths_for_index: Vec<String> = Vec::with_capacity(chunk.len());
+            for (path, size, key) in chunk {
+                let path_str = path.to_string_lossy().to_string();
+                paths_for_index.push(path_str.clone());
+                let parent_path = parent_dir(&path_str);
+                let name: Option<String> = path
+                    .file_name()
+                    .and_then(|os| os.to_str())
+                    .map(|s| s.to_string());
+                let file_type: Option<String> = path
+                    .extension()
+                    .and_then(|os| os.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+
+                params.push(Box::new(root));
+                params.push(Box::new(path_str));
+                params.push(Box::new(*size as i64));
+                params.push(Box::new(key.dev as i64));
+                params.push(Box::new(key.ino as i64));
+                params.push(Box::new(None::<String>));
+                params.push(Box::new(None::<i64>));
+                params.push(Box::new(name));
+                params.push(Box::new(file_type));
+                params.push(Box::new(parent_path));
+            }
+            let param_refs: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|b| b.as_ref()).collect();
+            tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
+
+            for path_str in paths_for_index {
+                let normalized = path_str.to_lowercase();
+                for trigram in make_trigrams(&normalized) {
+                    trigram_stmt.execute(rusqlite::params![root, &path_str, trigram])?;
+                }
+            }
         }
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-        tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
     }
 
     let folder_vec: Vec<_> = folder_sizes.iter().collect();
@@ -93,6 +125,129 @@ pub fn list_roots(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT DISTINCT root FROM folders ORDER BY root")?;
     let rows = stmt.query_map([], |row| row.get(0))?;
     rows.collect()
+}
+
+pub fn get_file_index(
+    conn: &Connection,
+    root: &str,
+) -> rusqlite::Result<Vec<(String, u64, u64, u64, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, size, dev, ino, type FROM files WHERE root = ?1",
+    )?;
+    let rows = stmt.query_map([root], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? as u64,
+            row.get::<_, i64>(2)? as u64,
+            row.get::<_, i64>(3)? as u64,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+pub fn search_files_by_substring(
+    conn: &Connection,
+    root: &str,
+    query: &str,
+    extension_set: Option<&HashSet<String>>,
+    limit: usize,
+) -> rusqlite::Result<Vec<(String, u64, u64, u64, Option<String>)>> {
+    let normalized_query = query.to_lowercase();
+    let trigrams = make_trigrams(&normalized_query);
+    if trigrams.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = String::from(
+        "SELECT f.path, f.size, f.dev, f.ino, f.type \
+         FROM file_search_trigrams t \
+         JOIN files f ON f.root = t.root AND f.path = t.path \
+         WHERE t.root = ?1 AND t.trigram IN (",
+    );
+
+    let mut placeholders: Vec<String> = Vec::with_capacity(trigrams.len());
+    for i in 0..trigrams.len() {
+        placeholders.push(format!("?{}", i + 2));
+    }
+    sql.push_str(&placeholders.join(", "));
+    sql.push(')');
+
+    let mut ext_values: Vec<String> = Vec::new();
+    if let Some(set) = extension_set {
+        if !set.is_empty() {
+            sql.push_str(" AND f.type IN (");
+            let mut ext_placeholders: Vec<String> = Vec::with_capacity(set.len());
+            for i in 0..set.len() {
+                ext_placeholders.push(format!("?{}", trigrams.len() + 2 + i));
+            }
+            sql.push_str(&ext_placeholders.join(", "));
+            sql.push(')');
+            ext_values.extend(set.iter().cloned());
+        }
+    }
+
+    let count_param_index = trigrams.len() + ext_values.len() + 2;
+    let limit_param_index = count_param_index + 1;
+
+    sql.push_str(
+        &format!(
+            " GROUP BY f.path, f.size, f.dev, f.ino, f.type \
+               HAVING COUNT(*) >= ?{} \
+               ORDER BY f.path \
+               LIMIT ?{}",
+            count_param_index, limit_param_index
+        ),
+    );
+
+    let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> =
+        Vec::with_capacity(2 + trigrams.len() + ext_values.len());
+    params.push(Box::new(root));
+    for t in &trigrams {
+        params.push(Box::new(t));
+    }
+    for ext in &ext_values {
+        params.push(Box::new(ext));
+    }
+    params.push(Box::new(trigrams.len() as i64));
+    params.push(Box::new(limit as i64));
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(param_refs), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let filtered: Vec<(String, u64, u64, u64, Option<String>)> = rows
+        .into_iter()
+        .filter(|(path, _, _, _, _)| path.to_lowercase().contains(&normalized_query))
+        .collect();
+
+    Ok(filtered)
+}
+
+pub fn get_folders_for_root(
+    conn: &Connection,
+    root: &str,
+) -> rusqlite::Result<Vec<(String, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, recursive_size FROM folders WHERE root = ?1",
+    )?;
+    let rows = stmt
+        .query_map([root], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 pub fn get_scan_result(

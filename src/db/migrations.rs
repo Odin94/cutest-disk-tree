@@ -52,6 +52,16 @@ pub const MIGRATION_5_CLEAR_CACHED_TREES_OTHER_FIX: &str = r#"
 DELETE FROM cached_trees;
 "#;
 
+pub const MIGRATION_6_REVERSE_INDEX: &str = r#"
+CREATE TABLE IF NOT EXISTS file_search_trigrams (
+    root TEXT NOT NULL,
+    path TEXT NOT NULL,
+    trigram TEXT NOT NULL,
+    PRIMARY KEY (root, path, trigram)
+);
+CREATE INDEX IF NOT EXISTS idx_trigrams_root_token ON file_search_trigrams(root, trigram);
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_1_INITIAL_SCHEMA),
@@ -59,6 +69,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_3_CACHED_TREES),
         M::up(MIGRATION_4_PARENT_PATH),
         M::up(MIGRATION_5_CLEAR_CACHED_TREES_OTHER_FIX),
+        M::up(MIGRATION_6_REVERSE_INDEX),
     ])
 }
 

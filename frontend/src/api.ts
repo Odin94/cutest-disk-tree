@@ -51,12 +51,16 @@ export const listCachedTreeDepths = (
 export const findFiles = (
   root: string,
   query: string,
-  extensions: string
+  extensions: string,
+  useFuzzy: boolean,
+  limit?: number
 ): Promise<FileSearchResult[]> =>
   invoke("find_files", {
     root,
     query,
     extensions: extensions.trim().length > 0 ? extensions : null,
+    limit: limit ?? 500,
+    use_fuzzy: useFuzzy,
   });
 
 export const pickDirectory = async (): Promise<string | null> => {

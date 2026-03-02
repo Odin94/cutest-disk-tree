@@ -34,6 +34,20 @@ npm run tauri dev
 
 Scan results are stored in SQLite in the app data directory (`index.db`). Each scan overwrites data for that root path; you can re-scan to refresh.
 
+### Debug logging and `.env`
+
+The Tauri host writes a `debug.log` file on startup. By default it lives next to `index.db` in the app data directory (see table below), but you can override the location with an environment variable loaded from `.env`:
+
+- `CUTE_DISK_TREE_DEBUG_LOG_PATH`: absolute path to the `debug.log` file that the app should use.
+
+Example `.env` in this repo (use forward slashes so backslashes are not treated as escapes; adjust path as needed):
+
+```bash
+CUTE_DISK_TREE_DEBUG_LOG_PATH=C:/Users/kamme/Desktop/repos/cute-tools/cutest-disk-tree/debug.log
+```
+
+On each app start, the file at `CUTE_DISK_TREE_DEBUG_LOG_PATH` (or the default path) is **truncated and rewritten** with a `=== starting cutest disk tree ===` header so each run gets a fresh log.
+
 **Database location** (app identifier `com.cutest.disk-tree`):
 
 | OS | Path |

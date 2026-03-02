@@ -294,7 +294,14 @@ export const DiskUsageView = ({
               ? `Loading cached scan${loadDetail}…`
               : "Listing cached roots…"}
           </p>
-          <Button type="button" variant="secondary" onClick={cancelLoad}>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={() => {
+              debugLog("DiskUsageView click Cancel (loading)");
+              cancelLoad();
+            }}
+          >
             Cancel
           </Button>
         </div>
@@ -310,7 +317,10 @@ export const DiskUsageView = ({
           <p>
             <Button
               type="button"
-              onClick={runScan}
+              onClick={() => {
+                debugLog("DiskUsageView click Scan a folder");
+                runScan();
+              }}
               disabled={scanning}
             >
               {scanning ? "Scanning…" : "Scan a folder"}
@@ -335,7 +345,9 @@ export const DiskUsageView = ({
                 className="disk-usage-root-select"
                 value={selectedRoot ?? ""}
                 onChange={(e) => {
-                  setSelectedRoot(e.target.value || null);
+                  const v = e.target.value || null;
+                  debugLog(`DiskUsageView select Volume value=${v ?? "(empty)"}`);
+                  setSelectedRoot(v);
                   setHoveredPath(null);
                 }}
               >
@@ -351,7 +363,10 @@ export const DiskUsageView = ({
             type="button"
             variant="secondary"
             size="sm"
-            onClick={runScan}
+            onClick={() => {
+              debugLog("DiskUsageView click Scan another folder");
+              runScan();
+            }}
             disabled={scanning}
           >
             {scanning ? "Scanning…" : "Scan another folder"}
@@ -366,7 +381,10 @@ export const DiskUsageView = ({
                   type="button"
                   variant="secondary"
                   size="sm"
-                  onClick={scanSelectedRoot}
+                  onClick={() => {
+                    debugLog("DiskUsageView click Scan this folder");
+                    scanSelectedRoot();
+                  }}
                   disabled={scanning}
                 >
                   {scanning ? "Scanning…" : "Scan this folder"}
@@ -421,7 +439,10 @@ export const DiskUsageView = ({
                 variant="secondary"
                 size="sm"
                 className="disk-usage-progress-cancel"
-                onClick={cancelScan}
+                onClick={() => {
+                  debugLog("DiskUsageView click Cancel scan");
+                  cancelScan();
+                }}
               >
                 Cancel scan
               </Button>

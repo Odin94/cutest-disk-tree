@@ -12,6 +12,7 @@ const CheckForUpdatesButton = () => {
   const [message, setMessage] = useState<string | null>(null);
 
   const check = async () => {
+    debugLog("App click Check for updates");
     setChecking(true);
     setMessage(null);
     try {
@@ -161,20 +162,29 @@ const App = () => {
         </button>
       </nav>
 
-      {category === "disk" ? (
-        <DiskUsageView />
-      ) : (
-        <FileFindingView
-          result={result}
-          loading={loading}
-          error={error}
-          progress={progress}
-          scanRootPath={scanRootPath}
-          onScan={runScan}
-          onCancelScan={cancelScan}
-          onSelectCachedRoot={handleSelectCachedRoot}
-        />
-      )}
+      <div className="views">
+        <div
+          className="view view-disk-usage"
+          style={{ display: category === "disk" ? "block" : "none" }}
+        >
+          <DiskUsageView />
+        </div>
+        <div
+          className="view view-file-finding"
+          style={{ display: category === "find" ? "block" : "none" }}
+        >
+          <FileFindingView
+            result={result}
+            loading={loading}
+            error={error}
+            progress={progress}
+            scanRootPath={scanRootPath}
+            onScan={runScan}
+            onCancelScan={cancelScan}
+            onSelectCachedRoot={handleSelectCachedRoot}
+          />
+        </div>
+      </div>
     </div>
   );
 };

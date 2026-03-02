@@ -1,4 +1,5 @@
 use cutest_disk_tree::{db, index_directory_parallel_with_progress};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::process;
@@ -24,18 +25,30 @@ struct SearchEntry {
 struct AppState {
     db_path: std::path::PathBuf,
     debug_log: Mutex<Option<std::path::PathBuf>>,
+    file_index: Mutex<HashMap<String, Vec<FileIndexEntry>>>,
+    folder_index: Mutex<HashMap<String, Vec<(String, u64)>>>,
+}
+
+#[derive(Clone)]
+struct FileIndexEntry {
+    path: String,
+    size: u64,
+    dev: u64,
+    ino: u64,
+    file_type: Option<String>,
 }
 
 fn write_debug_log(state: &AppState, message: &str) {
-    let path = state
-        .db_path
-        .parent()
-        .map(|p| p.join("debug.log"))
-        .unwrap_or_else(|| std::path::PathBuf::from("debug.log"));
     let mut guard = state.debug_log.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(path.clone());
-    }
+    let path = guard
+        .get_or_insert_with(|| {
+            state
+                .db_path
+                .parent()
+                .map(|p| p.join("debug.log"))
+                .unwrap_or_else(|| std::path::PathBuf::from("debug.log"))
+        })
+        .clone();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -54,11 +67,17 @@ fn debug_log(state: tauri::State<AppState>, message: String) -> Result<(), Strin
 
 #[tauri::command]
 fn get_debug_log_path(state: tauri::State<AppState>) -> Result<String, String> {
-    let path = state
-        .db_path
-        .parent()
-        .map(|p| p.join("debug.log"))
-        .unwrap_or_else(|| std::path::PathBuf::from("debug.log"));
+    let guard = state.debug_log.lock().unwrap();
+    let path = guard
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| {
+            state
+                .db_path
+                .parent()
+                .map(|p| p.join("debug.log"))
+                .unwrap_or_else(|| std::path::PathBuf::from("debug.log"))
+        });
     Ok(path.display().to_string())
 }
 
@@ -137,11 +156,19 @@ async fn scan_directory(
     };
 
     write_debug_log(&state, &format!("scan_directory done path={}", path));
+    clear_index_for_root(&state, &path);
     Ok(result)
+}
+
+fn clear_index_for_root(state: &AppState, root: &str) {
+    let _ = state.file_index.lock().unwrap().remove(root);
+    let _ = state.folder_index.lock().unwrap().remove(root);
+    write_debug_log(state, &format!("find_files index invalidated root={}", root));
 }
 
 #[tauri::command]
 async fn list_cached_roots(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let t0 = Instant::now();
     write_debug_log(&state, "list_cached_roots started");
     let db_path = state.db_path.clone();
     let roots = match tauri::async_runtime::spawn_blocking(move || {
@@ -160,7 +187,8 @@ async fn list_cached_roots(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
             return Err(e.to_string());
         }
     };
-    write_debug_log(&state, &format!("list_cached_roots done count={}", roots.len()));
+    let ms = t0.elapsed().as_millis();
+    write_debug_log(&state, &format!("list_cached_roots done count={} ms={}", roots.len(), ms));
     Ok(roots)
 }
 
@@ -169,6 +197,7 @@ async fn load_cached_scan(
     state: tauri::State<'_, AppState>,
     root: String,
 ) -> Result<Option<cutest_disk_tree::ScanResult>, String> {
+    let t0 = Instant::now();
     write_debug_log(&state, &format!("load_cached_scan started root={}", root));
     let db_path = state.db_path.clone();
     let root_clone = root.clone();
@@ -189,12 +218,14 @@ async fn load_cached_scan(
             return Err(e.to_string());
         }
     };
+    let ms = t0.elapsed().as_millis();
     write_debug_log(
         &state,
         &format!(
-            "load_cached_scan done root={} has_result={}",
+            "load_cached_scan done root={} has_result={} ms={}",
             root,
-            result.is_some()
+            result.is_some(),
+            ms
         ),
     );
     Ok(result)
@@ -384,159 +415,346 @@ fn find_files(
     root: String,
     query: String,
     extensions: Option<String>,
+    limit: Option<u32>,
+    use_fuzzy: Option<bool>,
 ) -> Result<Vec<SearchEntry>, String> {
+    const DEFAULT_LIMIT: u32 = 500;
+    let limit = limit.unwrap_or(DEFAULT_LIMIT) as usize;
+    let use_fuzzy = use_fuzzy.unwrap_or(true);
+    let total_start = Instant::now();
+
     write_debug_log(
         &state,
-        &format!("find_files started root={} query_len={}", root, query.len()),
+        &format!(
+            "find_files start root={} query_len={} limit={}",
+            root,
+            query.len(),
+            limit
+        ),
     );
+
     let log_err = |e: &dyn std::fmt::Display| {
         let s = e.to_string();
         write_debug_log(&state, &format!("error find_files: {}", s));
         s
     };
-    let conn = db::open_db(&state.db_path).map_err(|e| log_err(&e))?;
 
-    let mut sql = String::from(
-        "SELECT path, size, dev, ino FROM files WHERE root = ?1",
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(root.clone())];
-
-    if let Some(exts) = extensions {
-        let cleaned: Vec<String> = exts
-            .split(',')
-            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !cleaned.is_empty() {
-            sql.push_str(" AND type IN (");
-            for (i, _e) in cleaned.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&format!("?{}", i + 2));
-            }
-            sql.push(')');
-            for e in cleaned {
-                params.push(Box::new(e));
-            }
+    let (file_entries, _from_cache) = {
+        let guard = state.file_index.lock().unwrap();
+        if let Some(entries) = guard.get(&root) {
+            let t = total_start.elapsed().as_millis();
+            write_debug_log(
+                &state,
+                &format!("find_files index from_cache root={} count={} ms={}", root, entries.len(), t),
+            );
+            (entries.clone(), true)
+        } else {
+            drop(guard);
+            let load_start = Instant::now();
+            let conn = db::open_db(&state.db_path).map_err(|e| log_err(&e))?;
+            let rows = db::get_file_index(&conn, &root).map_err(|e| log_err(&e))?;
+            let load_ms = load_start.elapsed().as_millis();
+            let entries: Vec<FileIndexEntry> = rows
+                .into_iter()
+                .map(|(path, size, dev, ino, file_type)| FileIndexEntry {
+                    path,
+                    size,
+                    dev,
+                    ino,
+                    file_type,
+                })
+                .collect();
+            let count = entries.len();
+            state
+                .file_index
+                .lock()
+                .unwrap()
+                .insert(root.clone(), entries.clone());
+            write_debug_log(
+                &state,
+                &format!("find_files index loaded_from_db root={} count={} load_ms={}", root, count, load_ms),
+            );
+            (entries, false)
         }
-    }
+    };
 
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| log_err(&e))?;
+    let ext_filter_start = Instant::now();
+    let extension_set: Option<std::collections::HashSet<String>> = extensions.as_ref().and_then(|s| {
+        let cleaned: Vec<String> = s
+            .split(',')
+            .map(|x| x.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|x| !x.is_empty())
+            .collect();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.into_iter().collect())
+        }
+    });
 
-    let rows = stmt
-        .query_map(
-            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                    row.get::<_, i64>(3)? as u64,
-                ))
-            },
-        )
-        .map_err(|e| log_err(&e))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| log_err(&e))?;
+    let rows: Vec<&FileIndexEntry> = if let Some(ref set) = extension_set {
+        file_entries
+            .iter()
+            .filter(|e| {
+                e.file_type
+                    .as_ref()
+                    .map(|t| set.contains(t))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        file_entries.iter().collect()
+    };
+    let ext_filter_ms = ext_filter_start.elapsed().as_millis();
+    write_debug_log(
+        &state,
+        &format!("find_files after_ext_filter count={} ext_filter_ms={}", rows.len(), ext_filter_ms),
+    );
 
     if query.trim().is_empty() {
-        if rows.is_empty() {
-            write_debug_log(&state, "find_files done count=0 (empty query, no rows)");
-            return Ok(Vec::new());
-        }
-
+        let sort_start = Instant::now();
         let mut results: Vec<SearchEntry> = rows
-            .into_iter()
-            .map(|(path, size, dev, ino)| SearchEntry {
-                path,
-                size,
-                kind: "file".to_string(),
-                file_key: Some(cutest_disk_tree::FileKey { dev, ino }),
-            })
-            .collect();
-
-        results.sort_by(|a, b| a.path.cmp(&b.path));
-
-        write_debug_log(&state, &format!("find_files done count={}", results.len()));
-        return Ok(results);
-    }
-
-    let q = query.trim().to_lowercase();
-    let rows: Vec<_> = rows
-        .into_iter()
-        .filter(|(path, _, _, _)| path.to_lowercase().contains(&q))
-        .collect();
-
-    let labels: Vec<String> = rows.iter().map(|(path, _, _, _)| path.clone()).collect();
-
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let pattern = Pattern::parse(
-        &query,
-        CaseMatching::Smart,
-        Normalization::Smart,
-    );
-
-    let mut scored = pattern.match_list(
-        labels.iter().map(|s| s.as_str()),
-        &mut matcher,
-    );
-
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let mut results: Vec<SearchEntry> = Vec::new();
-    for (label, _score) in scored.into_iter().take(200) {
-        if let Some((path, size, dev, ino)) = rows
             .iter()
-            .find(|(p, _, _, _)| p == label)
-        {
-            results.push(SearchEntry {
-                path: path.clone(),
-                size: *size,
+            .map(|e| SearchEntry {
+                path: e.path.clone(),
+                size: e.size,
                 kind: "file".to_string(),
                 file_key: Some(cutest_disk_tree::FileKey {
-                    dev: *dev,
-                    ino: *ino,
+                    dev: e.dev,
+                    ino: e.ino,
                 }),
+            })
+            .collect();
+        results.sort_by(|a, b| a.path.cmp(&b.path));
+        let limited: Vec<SearchEntry> = results.into_iter().take(limit).collect();
+        let sort_ms = sort_start.elapsed().as_millis();
+        let total_ms = total_start.elapsed().as_millis();
+        write_debug_log(
+            &state,
+            &format!(
+                "find_files done empty_query count={} sort_take_ms={} total_ms={}",
+                limited.len(),
+                sort_ms,
+                total_ms
+            ),
+        );
+        return Ok(limited);
+    }
+
+    let q_trimmed = query.trim();
+    let q = q_trimmed.to_lowercase();
+    let q_len = q_trimmed.chars().count();
+
+    let mut results: Vec<SearchEntry> = Vec::new();
+
+    if !use_fuzzy {
+        let contains_start = Instant::now();
+        if q_len < 3 {
+            let filtered: Vec<&FileIndexEntry> = rows
+                .into_iter()
+                .filter(|e| e.path.to_lowercase().contains(&q))
+                .collect();
+            let contains_ms = contains_start.elapsed().as_millis();
+            write_debug_log(
+                &state,
+                &format!(
+                    "find_files substring_short_query count={} contains_ms={}",
+                    filtered.len(),
+                    contains_ms
+                ),
+            );
+
+            let sort_start = Instant::now();
+            results = filtered
+                .iter()
+                .map(|e| SearchEntry {
+                    path: e.path.clone(),
+                    size: e.size,
+                    kind: "file".to_string(),
+                    file_key: Some(cutest_disk_tree::FileKey {
+                        dev: e.dev,
+                        ino: e.ino,
+                    }),
+                })
+                .collect();
+            results.sort_by(|a, b| a.path.cmp(&b.path));
+            let sort_ms = sort_start.elapsed().as_millis();
+            let total_ms = total_start.elapsed().as_millis();
+            write_debug_log(
+                &state,
+                &format!(
+                    "find_files substring_short_query_done q_len={} count={} sort_take_ms={} total_ms={}",
+                    q_len,
+                    results.len(),
+                    sort_ms,
+                    total_ms,
+                ),
+            );
+        } else {
+            let conn = db::open_db(&state.db_path).map_err(|e| log_err(&e))?;
+            let db_results = db::search_files_by_substring(
+                &conn,
+                &root,
+                &q,
+                extension_set.as_ref(),
+                limit,
+            )
+            .map_err(|e| log_err(&e))?;
+            let contains_ms = contains_start.elapsed().as_millis();
+            write_debug_log(
+                &state,
+                &format!(
+                    "find_files substring_index q_len={} count={} contains_ms={}",
+                    q_len,
+                    db_results.len(),
+                    contains_ms
+                ),
+            );
+            results = db_results
+                .into_iter()
+                .map(|(path, size, dev, ino, _ty)| SearchEntry {
+                    path,
+                    size,
+                    kind: "file".to_string(),
+                    file_key: Some(cutest_disk_tree::FileKey { dev, ino }),
+                })
+                .collect();
+        }
+    } else {
+        let contains_start = Instant::now();
+        let filtered: Vec<&FileIndexEntry> = rows
+            .into_iter()
+            .filter(|e| e.path.to_lowercase().contains(&q))
+            .collect();
+        let contains_ms = contains_start.elapsed().as_millis();
+        write_debug_log(
+            &state,
+            &format!(
+                "find_files after_contains count={} contains_ms={}",
+                filtered.len(),
+                contains_ms
+            ),
+        );
+
+        if q_len < 3 {
+            let sort_start = Instant::now();
+            results = filtered
+                .iter()
+                .map(|e| SearchEntry {
+                    path: e.path.clone(),
+                    size: e.size,
+                    kind: "file".to_string(),
+                    file_key: Some(cutest_disk_tree::FileKey {
+                        dev: e.dev,
+                        ino: e.ino,
+                    }),
+                })
+                .collect();
+            results.sort_by(|a, b| a.path.cmp(&b.path));
+            let sort_ms = sort_start.elapsed().as_millis();
+            let total_ms = total_start.elapsed().as_millis();
+            write_debug_log(
+                &state,
+                &format!(
+                    "find_files short_query_no_fuzzy q_len={} count={} sort_take_ms={} total_ms={}",
+                    q_len,
+                    results.len(),
+                    sort_ms,
+                    total_ms,
+                ),
+            );
+        } else {
+            let nucleo_start = Instant::now();
+            let labels: Vec<&str> = filtered.iter().map(|e| e.path.as_str()).collect();
+            let mut matcher = Matcher::new(Config::DEFAULT);
+            let pattern =
+                Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart);
+            let mut scored = pattern.match_list(labels.iter().copied(), &mut matcher);
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            let nucleo_ms = nucleo_start.elapsed().as_millis();
+            write_debug_log(
+                &state,
+                &format!(
+                    "find_files nucleo scored={} nucleo_ms={}",
+                    scored.len(),
+                    nucleo_ms
+                ),
+            );
+
+            for (label, _score) in scored.into_iter().take(limit) {
+                if let Some(e) = filtered.iter().find(|e| e.path.as_str() == label) {
+                    results.push(SearchEntry {
+                        path: e.path.clone(),
+                        size: e.size,
+                        kind: "file".to_string(),
+                        file_key: Some(cutest_disk_tree::FileKey {
+                            dev: e.dev,
+                            ino: e.ino,
+                        }),
+                    });
+                }
+            }
+        }
+    }
+
+    let folders_start = Instant::now();
+    let folder_list = {
+        let guard = state.folder_index.lock().unwrap();
+        if let Some(list) = guard.get(&root) {
+            list.clone()
+        } else {
+            drop(guard);
+            let conn = db::open_db(&state.db_path).map_err(|e| log_err(&e))?;
+            let list = db::get_folders_for_root(&conn, &root).map_err(|e| log_err(&e))?;
+            state.folder_index.lock().unwrap().insert(root.clone(), list.clone());
+            list
+        }
+    };
+    for (path, recursive_size) in folder_list.into_iter() {
+        if path.to_lowercase().contains(&q) {
+            results.push(SearchEntry {
+                path,
+                size: recursive_size,
+                kind: "folder".to_string(),
+                file_key: None,
             });
         }
     }
+    let folders_ms = folders_start.elapsed().as_millis();
+    write_debug_log(
+        &state,
+        &format!("find_files folders added folders_ms={} result_count={}", folders_ms, results.len()),
+    );
 
-    if !query.trim().is_empty() {
-        let mut folder_stmt = conn
-            .prepare("SELECT path, recursive_size FROM folders WHERE root = ?1")
-            .map_err(|e| log_err(&e))?;
-        let folder_rows = folder_stmt
-            .query_map([&root], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? as u64,
-                ))
-            })
-            .map_err(|e| log_err(&e))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| log_err(&e))?;
+    let total_ms = total_start.elapsed().as_millis();
+    write_debug_log(
+        &state,
+        &format!("find_files done count={} total_ms={}", results.len(), total_ms),
+    );
+    Ok(results)
+}
 
-        for (path, recursive_size) in folder_rows.into_iter() {
-            if path.to_lowercase().contains(&q) {
-                results.push(SearchEntry {
-                    path,
-                    size: recursive_size,
-                    kind: "folder".to_string(),
-                    file_key: None,
-                });
-            }
+fn load_dotenv_from_repo() {
+    let mut dir = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(_) => return,
+    };
+    loop {
+        dir.pop();
+        let env_path = dir.join(".env");
+        if env_path.is_file() {
+            let _ = dotenvy::from_path(env_path);
+            break;
+        }
+        if !dir.pop() {
+            break;
         }
     }
-
-    write_debug_log(&state, &format!("find_files done count={}", results.len()));
-    Ok(results)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    load_dotenv_from_repo();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -546,19 +764,28 @@ pub fn run() {
             std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
             let db_path = path.join("index.db");
             db::open_db(&db_path).map_err(|e| e.to_string())?;
-            let debug_log_path = path.join("debug.log");
+
+            let env_log_path = std::env::var("CUTE_DISK_TREE_DEBUG_LOG_PATH").ok();
+            let debug_log_path = env_log_path
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| path.join("debug.log"));
+
             let _ = std::fs::OpenOptions::new()
                 .create(true)
-                .append(true)
+                .write(true)
+                .truncate(true)
                 .open(&debug_log_path)
                 .and_then(|mut f| {
                     use std::io::Write;
                     f.write_all(b"=== starting cutest disk tree ===\n\n")?;
                     f.flush()
                 });
+
             app.manage(AppState {
                 db_path,
-                debug_log: Mutex::new(None),
+                debug_log: Mutex::new(Some(debug_log_path)),
+                file_index: Mutex::new(HashMap::new()),
+                folder_index: Mutex::new(HashMap::new()),
             });
             Ok(())
         })

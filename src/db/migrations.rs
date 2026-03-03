@@ -82,6 +82,13 @@ CREATE INDEX IF NOT EXISTS idx_items_root_kind_ext ON items(root, kind, ext);
 CREATE INDEX IF NOT EXISTS idx_items_dev_ino ON items(dev, ino);
 "#;
 
+pub const MIGRATION_8_ITEMS_LOWER: &str = r#"
+ALTER TABLE items ADD COLUMN path_lower TEXT;
+ALTER TABLE items ADD COLUMN name_lower TEXT;
+CREATE INDEX IF NOT EXISTS idx_items_root_path_lower ON items(root, path_lower);
+CREATE INDEX IF NOT EXISTS idx_items_root_name_lower ON items(root, name_lower);
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_1_INITIAL_SCHEMA),
@@ -91,6 +98,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_5_CLEAR_CACHED_TREES_OTHER_FIX),
         M::up(MIGRATION_6_REVERSE_INDEX),
         M::up(MIGRATION_7_UNIFIED_ITEMS),
+        M::up(MIGRATION_8_ITEMS_LOWER),
     ])
 }
 

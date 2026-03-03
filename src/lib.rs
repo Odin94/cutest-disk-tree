@@ -44,8 +44,10 @@ pub enum DiskObjectKind {
 pub struct DiskObject {
     pub root: String,
     pub path: String,
+    pub path_lower: String,
     pub parent_path: Option<String>,
     pub name: String,
+    pub name_lower: String,
     pub ext: Option<String>,
     pub kind: DiskObjectKind,
     pub size: Option<u64>,

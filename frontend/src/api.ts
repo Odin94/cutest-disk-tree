@@ -48,19 +48,26 @@ export const listCachedTreeDepths = (
 ): Promise<number[]> =>
   invoke("list_cached_tree_depths", { root, maxChildren: maxChildrenPerNode });
 
+export type FindFilesResponse = {
+  items: FileSearchResult[];
+  nextOffset: number | null;
+};
+
 export const findFiles = (
   root: string,
   query: string,
   extensions: string,
   useFuzzy: boolean,
-  limit?: number
-): Promise<FileSearchResult[]> =>
+  limit?: number,
+  offset?: number
+): Promise<FindFilesResponse> =>
   invoke("find_files", {
     root,
     query,
     extensions: extensions.trim().length > 0 ? extensions : null,
     limit: limit ?? 500,
     use_fuzzy: useFuzzy,
+    offset: offset ?? 0,
   });
 
 export const pickDirectory = async (): Promise<string | null> => {

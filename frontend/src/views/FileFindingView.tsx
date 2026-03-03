@@ -1,20 +1,13 @@
-import { useState, useEffect, useRef, useMemo, memo, useCallback } from "react";
-import { findFiles, listCachedRoots, debugLog } from "../api";
-import type { ScanResult, ScanProgress, FileSearchResult } from "../types";
-import { humanSize, progressTopLevelFolder } from "../utils";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { debugLog, findFiles, listCachedRoots } from "../api";
 import { Button } from "../components/ui/button";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHeadCell,
-  TableHeader,
-  TableRow,
-} from "../components/ui/table";
+import type { FileSearchResult, ScanProgress, ScanResult } from "../types";
+import { humanSize, progressTopLevelFolder } from "../utils";
+import { FindResultsTable } from "./FileFindingView/FindResultsTable";
 
 type TabId = "folders" | "files" | "duplicates" | "find";
-type FindSortKey = "name" | "size" | "path";
-type FindSortDirection = "asc" | "desc";
+export type FindSortKey = "name" | "size" | "path";
+export type FindSortDirection = "asc" | "desc";
 type FileCategory =
   | "all"
   | "audio"
@@ -27,139 +20,7 @@ type FileCategory =
   | "folder"
   | "other";
 
-const MAX_VISIBLE_FILES = 500;
-
-type FindResultsTableProps = {
-  visibleSearchResults: FileSearchResult[];
-  totalMatches: number;
-  searchLoading: boolean;
-  findSortKey: FindSortKey;
-  findSortDirection: FindSortDirection;
-  onToggleSort: (key: FindSortKey) => void;
-};
-
-const FindResultsTable = memo(({
-  visibleSearchResults,
-  totalMatches,
-  searchLoading,
-  findSortKey,
-  findSortDirection,
-  onToggleSort,
-}: FindResultsTableProps) => {
-  const renderT0 = performance.now();
-  const out = (
-    <div className="find-table-wrap">
-      <Table className="find-table">
-        <TableHeader>
-          <TableRow>
-            <TableHeadCell>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="find-sort"
-                onClick={() => {
-                  debugLog("FileFindingView click sort name");
-                  onToggleSort("name");
-                }}
-              >
-                File name
-                {findSortKey === "name"
-                  ? findSortDirection === "asc"
-                    ? " ▲"
-                    : " ▼"
-                  : ""}
-              </Button>
-            </TableHeadCell>
-            <TableHeadCell>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="find-sort"
-                onClick={() => {
-                  debugLog("FileFindingView click sort size");
-                  onToggleSort("size");
-                }}
-              >
-                Size
-                {findSortKey === "size"
-                  ? findSortDirection === "asc"
-                    ? " ▲"
-                    : " ▼"
-                  : ""}
-              </Button>
-            </TableHeadCell>
-            <TableHeadCell>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="find-sort"
-                onClick={() => {
-                  debugLog("FileFindingView click sort path");
-                  onToggleSort("path");
-                }}
-              >
-                Path
-                {findSortKey === "path"
-                  ? findSortDirection === "asc"
-                    ? " ▲"
-                    : " ▼"
-                  : ""}
-              </Button>
-            </TableHeadCell>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {visibleSearchResults.map((f) => (
-            <TableRow
-              key={`${f.path}:${f.file_key?.dev ?? "d"}:${f.file_key?.ino ?? "i"}`}
-            >
-              <TableCell
-                className="find-cell-name"
-                title={getFileName(f.path)}
-              >
-                {getFileName(f.path)}
-              </TableCell>
-              <TableCell className="find-cell-size">
-                {humanSize(f.size)}
-              </TableCell>
-              <TableCell
-                className="find-cell-path"
-                title={f.path}
-              >
-                {f.path}
-              </TableCell>
-            </TableRow>
-          ))}
-          {visibleSearchResults.length === 0 && !searchLoading ? (
-            <TableRow>
-              <TableCell className="find-empty" colSpan={3}>
-                No matches yet.
-              </TableCell>
-            </TableRow>
-          ) : null}
-          {totalMatches > MAX_VISIBLE_FILES ? (
-            <TableRow>
-              <TableCell className="find-status-bottom" colSpan={3}>
-                {`Showing first ${MAX_VISIBLE_FILES.toLocaleString()} matches out of ${totalMatches.toLocaleString()} total.`}
-              </TableCell>
-            </TableRow>
-          ) : null}
-        </TableBody>
-      </Table>
-    </div>
-  );
-  const renderMs = performance.now() - renderT0;
-  if (renderMs > 10) {
-    debugLog(
-      `find_ui FindResultsTable render slow ms=${renderMs.toFixed(1)} rows=${visibleSearchResults.length}`
-    );
-  }
-  return out;
-});
-FindResultsTable.displayName = "FindResultsTable";
+export const MAX_VISIBLE_FILES = 500;
 
 type FileFindingViewProps = {
   result: ScanResult | null;
@@ -172,7 +33,7 @@ type FileFindingViewProps = {
   onSelectCachedRoot?: (root: string) => Promise<void>;
 };
 
-const getFileName = (path: string): string => {
+export const getFileName = (path: string): string => {
   const segments = path.split(/[/\\]/);
   if (segments.length === 0) return path;
   return segments[segments.length - 1] ?? path;
@@ -196,6 +57,8 @@ export const FileFindingView = ({
   const [useFuzzySearch, setUseFuzzySearch] = useState(false);
   const [searchResults, setSearchResults] = useState<FileSearchResult[]>([]);
   const [searchTotalCount, setSearchTotalCount] = useState<number | null>(null);
+  const [searchNextOffset, setSearchNextOffset] = useState<number | null>(null);
+  const [searchLoadingMore, setSearchLoadingMore] = useState(false);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [findSortKey, setFindSortKey] = useState<FindSortKey>("name");
@@ -206,6 +69,8 @@ export const FileFindingView = ({
     root: string;
     query: string;
     extensions: string;
+    category: FileCategory;
+    fuzzy: boolean;
   } | null>(null);
 
   useEffect(() => {
@@ -215,10 +80,6 @@ export const FileFindingView = ({
   useEffect(() => {
     lastQueryRef.current = null;
   }, [result?.root]);
-
-  debugLog(
-    `find_ui FileFindingView render start query_len=${searchQuery.length} results=${searchResults.length} loading=${searchLoading}`
-  );
 
   const { uniqueCount, uniqueSize, folderList, largestFiles } = useMemo(() => {
     if (result === null) {
@@ -277,16 +138,26 @@ export const FileFindingView = ({
     return unique.join(", ");
   };
 
+  const PAGE_SIZE = MAX_VISIBLE_FILES;
+
   const runSearch = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!canSearch || result === null) return;
     const extension = getEffectiveExtensions();
-    const queryKey = { root: result.root, query: searchQuery, extensions: extension };
+    const queryKey = {
+      root: result.root,
+      query: searchQuery,
+      extensions: extension,
+      category: searchCategory,
+      fuzzy: useFuzzySearch,
+    };
     if (
       lastQueryRef.current &&
       lastQueryRef.current.root === queryKey.root &&
       lastQueryRef.current.query === queryKey.query &&
-      lastQueryRef.current.extensions === queryKey.extensions
+      lastQueryRef.current.extensions === queryKey.extensions &&
+      lastQueryRef.current.category === queryKey.category &&
+      lastQueryRef.current.fuzzy === queryKey.fuzzy
     ) {
       debugLog("FileFindingView runSearch skip (same query as current data)");
       return;
@@ -296,23 +167,27 @@ export const FileFindingView = ({
       `find_ui find_files request start root=${result.root} query_len=${searchQuery.length} ext=${extension.length > 0 ? "yes" : "no"} fuzzy=${useFuzzySearch ? "on" : "off"}`
     );
     setSearchLoading(true);
+    setSearchLoadingMore(false);
+    setSearchResults([]);
+    setSearchNextOffset(null);
+    setSearchTotalCount(null);
     setSearchError(null);
     try {
-      const found = await findFiles(
+      const response = await findFiles(
         result.root,
         searchQuery,
         extension,
-        useFuzzySearch
+        useFuzzySearch,
+        PAGE_SIZE,
+        0
       );
       lastQueryRef.current = queryKey;
       const elapsed = (performance.now() - reqT0).toFixed(0);
-      debugLog(`find_ui find_files response received count=${found.length} elapsedMs=${elapsed}`);
-      setSearchTotalCount(found.length);
-      const limited =
-        found.length > MAX_VISIBLE_FILES
-          ? found.slice(0, MAX_VISIBLE_FILES)
-          : found;
-      setSearchResults(limited);
+      debugLog(
+        `find_ui find_files response received count=${response.items.length} nextOffset=${response.nextOffset ?? "null"} elapsedMs=${elapsed}`
+      );
+      setSearchResults(response.items);
+      setSearchNextOffset(response.nextOffset);
     } catch (e) {
       debugLog(
         `FileFindingView runSearch error: ${e instanceof Error ? e.message : String(e)}`
@@ -331,12 +206,16 @@ export const FileFindingView = ({
         root: result.root,
         query: searchQuery,
         extensions: extension,
+        category: searchCategory,
+        fuzzy: useFuzzySearch,
       };
       if (
         lastQueryRef.current &&
         lastQueryRef.current.root === queryKey.root &&
         lastQueryRef.current.query === queryKey.query &&
-        lastQueryRef.current.extensions === queryKey.extensions
+        lastQueryRef.current.extensions === queryKey.extensions &&
+        lastQueryRef.current.category === queryKey.category &&
+        lastQueryRef.current.fuzzy === queryKey.fuzzy
       ) {
         debugLog("FileFindingView findFiles (debounced) skip (same query as current data)");
         return;
@@ -346,18 +225,20 @@ export const FileFindingView = ({
         `find_ui find_files request start (debounced) root=${result.root} query_len=${searchQuery.length} ext=${extension.length > 0 ? "yes" : "no"} fuzzy=${useFuzzySearch ? "on" : "off"}`
       );
       setSearchLoading(true);
+      setSearchLoadingMore(false);
+      setSearchResults([]);
+      setSearchNextOffset(null);
+      setSearchTotalCount(null);
       setSearchError(null);
-      findFiles(result.root, searchQuery, extension, useFuzzySearch)
-        .then((found) => {
+      findFiles(result.root, searchQuery, extension, useFuzzySearch, PAGE_SIZE, 0)
+        .then((response) => {
           lastQueryRef.current = queryKey;
           const elapsed = (performance.now() - reqT0).toFixed(0);
-          debugLog(`find_ui find_files response received (debounced) count=${found.length} elapsedMs=${elapsed}`);
-          setSearchTotalCount(found.length);
-          const limited =
-            found.length > MAX_VISIBLE_FILES
-              ? found.slice(0, MAX_VISIBLE_FILES)
-              : found;
-          setSearchResults(limited);
+          debugLog(
+            `find_ui find_files response received (debounced) count=${response.items.length} nextOffset=${response.nextOffset ?? "null"} elapsedMs=${elapsed}`
+          );
+          setSearchResults(response.items);
+          setSearchNextOffset(response.nextOffset);
         })
         .catch((e) => {
           const msg = e instanceof Error ? e.message : String(e);
@@ -373,6 +254,7 @@ export const FileFindingView = ({
     result?.root,
     searchQuery,
     searchExtensions,
+    searchCategory,
     useFuzzySearch,
   ]);
 
@@ -437,13 +319,59 @@ export const FileFindingView = ({
       return findSortDirection === "asc" ? cmp : -cmp;
     });
     return {
-      visibleSearchResults: sorted.slice(0, MAX_VISIBLE_FILES),
+      visibleSearchResults: sorted,
       sortedCount: sorted.length,
     };
   }, [searchResults, searchCategory, findSortKey, findSortDirection]);
 
   const totalMatches =
     searchTotalCount != null ? searchTotalCount : sortedCount;
+
+  const canLoadMore = searchNextOffset != null;
+
+  const handleLoadMore = async () => {
+    if (!canSearch || result === null) return;
+    if (!canLoadMore) return;
+    const extension = getEffectiveExtensions();
+    const queryKey = {
+      root: result.root,
+      query: searchQuery,
+      extensions: extension,
+      category: searchCategory,
+      fuzzy: useFuzzySearch,
+    };
+    const reqT0 = performance.now();
+    debugLog(
+      `find_ui find_files request load_more root=${result.root} query_len=${searchQuery.length} ext=${extension.length > 0 ? "yes" : "no"} fuzzy=${useFuzzySearch ? "on" : "off"} offset=${searchNextOffset}`
+    );
+    setSearchLoadingMore(true);
+    try {
+      const response = await findFiles(
+        result.root,
+        searchQuery,
+        extension,
+        useFuzzySearch,
+        PAGE_SIZE,
+        searchNextOffset ?? 0
+      );
+      lastQueryRef.current = queryKey;
+      const elapsed = (performance.now() - reqT0).toFixed(0);
+      debugLog(
+        `find_ui find_files response received load_more count=${response.items.length} nextOffset=${response.nextOffset ?? "null"} elapsedMs=${elapsed}`
+      );
+      setSearchResults((prev) => [...prev, ...response.items]);
+      setSearchNextOffset(response.nextOffset);
+    } catch (e) {
+      debugLog(
+        `FileFindingView loadMore error: ${
+          e instanceof Error ? e.message : String(e)
+        }`
+      );
+      setSearchError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSearchLoadingMore(false);
+    }
+  };
 
   const toggleFindSort = useCallback((key: FindSortKey) => {
     setFindSortKey((current) => {
@@ -734,20 +662,20 @@ export const FileFindingView = ({
                   <p className="find-status">Searching files…</p>
                 ) : totalMatches > 0 ? (
                   <p className="find-status">
-                    {`${totalMatches.toLocaleString()} matching item${totalMatches === 1 ? "" : "s"
-                      }${totalMatches > MAX_VISIBLE_FILES
-                        ? ` (showing first ${MAX_VISIBLE_FILES.toLocaleString()})`
-                        : ""
-                      }`}
+                    {`${totalMatches.toLocaleString()} matching item${
+                      totalMatches === 1 ? "" : "s"
+                    }${canLoadMore ? " (more available…)" : ""}`}
                   </p>
                 ) : null}
                 <FindResultsTable
                   visibleSearchResults={visibleSearchResults}
-                  totalMatches={totalMatches}
                   searchLoading={searchLoading}
                   findSortKey={findSortKey}
                   findSortDirection={findSortDirection}
                   onToggleSort={toggleFindSort}
+                  hasMore={canLoadMore}
+                  loadingMore={searchLoadingMore}
+                  onLoadMore={handleLoadMore}
                 />
               </div>
             )}

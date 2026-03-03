@@ -85,23 +85,27 @@ pub fn write_scan(
         tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
 
         let row_placeholders_items = (0..chunk.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .collect::<Vec<_>>()
             .join(", ");
         let sql_items = format!(
-            "INSERT INTO items (root, path, parent_path, name, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
+            "INSERT INTO items (root, path, path_lower, parent_path, name, name_lower, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
             row_placeholders_items
         );
         let mut item_params: Vec<Box<dyn rusqlite::ToSql + '_>> =
-            Vec::with_capacity(chunk.len() * 11);
+            Vec::with_capacity(chunk.len() * 13);
         for entry in chunk {
             let path_str = entry.path.to_string_lossy().to_string();
+            let path_lower = path_str.to_ascii_lowercase();
             let parent_path = parent_dir(&path_str);
             let name: Option<String> = entry
                 .path
                 .file_name()
                 .and_then(|os| os.to_str())
                 .map(|s| s.to_string());
+            let name_lower: Option<String> = name
+                .as_ref()
+                .map(|s| s.to_ascii_lowercase());
             let ext: Option<String> = entry
                 .path
                 .extension()
@@ -110,8 +114,10 @@ pub fn write_scan(
 
             item_params.push(Box::new(root));
             item_params.push(Box::new(path_str));
+            item_params.push(Box::new(path_lower));
             item_params.push(Box::new(parent_path));
             item_params.push(Box::new(name));
+            item_params.push(Box::new(name_lower));
             item_params.push(Box::new(ext));
             item_params.push(Box::new("file"));
             item_params.push(Box::new(entry.size as i64));
@@ -146,26 +152,32 @@ pub fn write_scan(
 
         // Also populate unified items table for folders
         let row_placeholders_items = (0..chunk.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .collect::<Vec<_>>()
             .join(", ");
         let sql_items = format!(
-            "INSERT INTO items (root, path, parent_path, name, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
+            "INSERT INTO items (root, path, path_lower, parent_path, name, name_lower, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
             row_placeholders_items
         );
         let mut item_params: Vec<Box<dyn rusqlite::ToSql + '_>> =
-            Vec::with_capacity(chunk.len() * 11);
+            Vec::with_capacity(chunk.len() * 13);
         for (path, size) in chunk.iter() {
             let path_str = path.to_string_lossy().to_string();
+            let path_lower = path_str.to_ascii_lowercase();
             let parent_path = parent_dir(&path_str);
             let name = path
                 .file_name()
                 .and_then(|os| os.to_str())
                 .map(|s| s.to_string());
+            let name_lower: Option<String> = name
+                .as_ref()
+                .map(|s| s.to_ascii_lowercase());
             item_params.push(Box::new(root));
             item_params.push(Box::new(path_str));
+            item_params.push(Box::new(path_lower));
             item_params.push(Box::new(parent_path));
             item_params.push(Box::new(name));
+            item_params.push(Box::new(name_lower));
             item_params.push(Box::new(None::<String>));
             item_params.push(Box::new("folder"));
             item_params.push(Box::new(None::<i64>));
@@ -213,26 +225,33 @@ pub fn get_disk_objects_for_root(
     root: &str,
 ) -> rusqlite::Result<Vec<crate::DiskObject>> {
     let mut stmt = conn.prepare(
-        "SELECT path, parent_path, name, ext, kind, size, recursive_size, dev, ino, mtime \
+        "SELECT path, path_lower, parent_path, name, name_lower, ext, kind, size, recursive_size, dev, ino, mtime \
          FROM items WHERE root = ?1",
     )?;
     let rows = stmt.query_map([root], |row| {
-        let kind_str: String = row.get(4)?;
+        let kind_str: String = row.get(6)?;
         let kind = match kind_str.as_str() {
             "folder" => crate::DiskObjectKind::Folder,
             _ => crate::DiskObjectKind::File,
         };
-        let size_opt: Option<i64> = row.get(5)?;
-        let rec_opt: Option<i64> = row.get(6)?;
-        let dev_opt: Option<i64> = row.get(7)?;
-        let ino_opt: Option<i64> = row.get(8)?;
-        let mtime_opt: Option<i64> = row.get(9)?;
+        let size_opt: Option<i64> = row.get(7)?;
+        let rec_opt: Option<i64> = row.get(8)?;
+        let dev_opt: Option<i64> = row.get(9)?;
+        let ino_opt: Option<i64> = row.get(10)?;
+        let mtime_opt: Option<i64> = row.get(11)?;
+        let path: String = row.get(0)?;
+        let path_lower_from_db: Option<String> = row.get(1)?;
+        let name_opt: Option<String> = row.get(3)?;
+        let name = name_opt.unwrap_or_default();
+        let name_lower_from_db: Option<String> = row.get(4)?;
         Ok(crate::DiskObject {
             root: root.to_string(),
-            path: row.get::<_, String>(0)?,
-            parent_path: row.get::<_, Option<String>>(1)?,
-            name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            ext: row.get::<_, Option<String>>(3)?,
+            path: path.clone(),
+            path_lower: path_lower_from_db.unwrap_or_else(|| path.to_ascii_lowercase()),
+            parent_path: row.get::<_, Option<String>>(2)?,
+            name: name.clone(),
+            name_lower: name_lower_from_db.unwrap_or_else(|| name.to_ascii_lowercase()),
+            ext: row.get::<_, Option<String>>(5)?,
             kind,
             size: size_opt.map(|n| n as u64),
             recursive_size: rec_opt.map(|n| n as u64),

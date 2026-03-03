@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
-import { scanDirectory, pickDirectory, onScanProgress, loadCachedScan, debugLog, onScanPhaseStatus } from "./api";
-import type { ScanResult, ScanProgress } from "./types";
+import { scanDirectory, pickDirectory, onScanProgress, loadCachedScan, debugLog, onScanPhaseStatus, onScanFolderSizesReady } from "./api";
+import type { ScanResult, ScanProgress, FolderSizesReady } from "./types";
 import "./App.css";
 import { DiskUsageView } from "./views/DiskUsageView";
 import { FileFindingView } from "./views/FileFindingView";
@@ -64,6 +64,10 @@ const App = () => {
   const scanCancelRef = useRef(false);
   const progressLogTimeRef = useRef(0);
   const PROGRESS_LOG_INTERVAL_MS = 2000;
+  // Holds the most recently received folder-sizes event payload. Phase 2 can
+  // emit this before scanDirectory's invoke promise resolves, so we stash it
+  // here and apply it right after setResult(data) to avoid the race.
+  const latestFolderSizesRef = useRef<FolderSizesReady | null>(null);
 
   const runScan = async () => {
     debugLog("App runScan pickDirectory opened");
@@ -73,6 +77,7 @@ const App = () => {
       return;
     }
     debugLog(`App runScan initiated path=${path}`);
+    latestFolderSizesRef.current = null;
     setScanRootPath(path);
     setLoading(true);
     setProgress(null);
@@ -96,6 +101,15 @@ const App = () => {
       }
       debugLog(`App runScan done path=${path} files=${data.files.length}`);
       setResult(data);
+      // If the folder-sizes event already arrived before this point, apply it
+      // now on top of the just-set result (React batches these two updates).
+      const latestSizes = latestFolderSizesRef.current as FolderSizesReady | null;
+      if (latestSizes !== null && latestSizes.root === path) {
+        const folderSizes = latestSizes.folder_sizes;
+        setResult((prev) =>
+          prev !== null ? { ...prev, folder_sizes: folderSizes } : prev
+        );
+      }
       if (category !== "find") setCategory("find");
     } catch (e) {
       if (!scanCancelRef.current) {
@@ -106,10 +120,6 @@ const App = () => {
       if (unlistenRef.current) {
         unlistenRef.current();
         unlistenRef.current = null;
-      }
-      if (phaseStatusUnlistenRef.current) {
-        phaseStatusUnlistenRef.current();
-        phaseStatusUnlistenRef.current = null;
       }
       setLoading(false);
       setProgress(null);
@@ -123,10 +133,6 @@ const App = () => {
     if (unlistenRef.current) {
       unlistenRef.current();
       unlistenRef.current = null;
-    }
-    if (phaseStatusUnlistenRef.current) {
-      phaseStatusUnlistenRef.current();
-      phaseStatusUnlistenRef.current = null;
     }
     setLoading(false);
     setProgress(null);
@@ -151,6 +157,32 @@ const App = () => {
         phaseStatusUnlistenRef.current();
         phaseStatusUnlistenRef.current = null;
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    let unlisten: (() => void) | null = null;
+    onScanFolderSizesReady((payload) => {
+      if (!isMounted) return;
+      // Always stash the payload so runScan can pick it up even if it arrives
+      // before setResult(data) runs.
+      latestFolderSizesRef.current = payload;
+      setResult((prev) =>
+        prev !== null && prev.root === payload.root
+          ? { ...prev, folder_sizes: payload.folder_sizes }
+          : prev
+      );
+    }).then((fn) => {
+      if (!isMounted) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      isMounted = false;
+      if (unlisten !== null) unlisten();
     };
   }, []);
 

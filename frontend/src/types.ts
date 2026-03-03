@@ -21,6 +21,11 @@ export type ScanResult = {
   folder_sizes: Record<string, number>;
 };
 
+export type FolderSizesReady = {
+  root: string;
+  folder_sizes: Record<string, number>;
+};
+
 export type FileSearchResult = {
   kind: SearchItemKind;
   path: string;

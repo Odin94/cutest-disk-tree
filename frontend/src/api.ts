@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ScanResult, ScanProgress, FileSearchResult } from "./types";
+import type { ScanResult, ScanProgress, FileSearchResult, FolderSizesReady } from "./types";
 import type { DiskTreeNode } from "./utils/diskTree";
 
 export const buildDiskTreeCached = (
@@ -38,6 +38,15 @@ export const onScanProgress = (callback: (progress: ScanProgress) => void) => {
 
 export const onScanPhaseStatus = (callback: (status: string) => void) => {
   const unlisten = listen<string>("scan-phase-status", (event) => {
+    callback(event.payload);
+  });
+  return unlisten;
+};
+
+export const onScanFolderSizesReady = (
+  callback: (payload: FolderSizesReady) => void
+) => {
+  const unlisten = listen<FolderSizesReady>("scan-folder-sizes-ready", (event) => {
     callback(event.payload);
   });
   return unlisten;

@@ -45,7 +45,29 @@ CREATE TABLE IF NOT EXISTS file_search_trigrams (
 CREATE INDEX IF NOT EXISTS idx_trigrams_root_token ON file_search_trigrams(root, trigram);
 "#;
 
+pub const MIGRATION_2_SCAN_METADATA: &str = r#"
+CREATE TABLE IF NOT EXISTS scan_metadata (
+    root TEXT NOT NULL PRIMARY KEY,
+    disk_objects_update_id INTEGER NOT NULL DEFAULT 0,
+    disk_objects_last_updated INTEGER NOT NULL DEFAULT 0,
+    suffix_index_update_id INTEGER NOT NULL DEFAULT 0,
+    suffix_index_last_updated INTEGER NOT NULL DEFAULT 0,
+    cached_trees_update_id INTEGER NOT NULL DEFAULT 0,
+    cached_trees_last_updated INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS suffix_index_data (
+    root TEXT NOT NULL PRIMARY KEY,
+    buffer TEXT NOT NULL,
+    offsets BLOB NOT NULL,
+    disk_object_indices BLOB NOT NULL
+);
+"#;
+
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(MIGRATION_1_INITIAL_SCHEMA)])
+    Migrations::new(vec![
+        M::up(MIGRATION_1_INITIAL_SCHEMA),
+        M::up(MIGRATION_2_SCAN_METADATA),
+    ])
 }
 

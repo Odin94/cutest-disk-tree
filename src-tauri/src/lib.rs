@@ -15,6 +15,12 @@ use chrono::Utc;
 use std::io::Write;
 use sysinfo::{Pid, System};
 
+#[derive(Clone, Serialize)]
+struct FolderSizesReady {
+    root: String,
+    folder_sizes: HashMap<String, u64>,
+}
+
 #[derive(Serialize)]
 struct SearchEntry {
     path: String,
@@ -267,6 +273,10 @@ struct SuffixIndex {
     st: SuffixTable<'static, 'static>,
     offsets: Vec<usize>,
     disk_object_indices: Vec<usize>,
+    /// The concatenated `name_lower\0` string passed to `SuffixTable::new`.
+    /// Kept so the index can be serialised to the database without re-scanning
+    /// the DiskObject vec.
+    buffer: String,
 }
 
 // Returns (index, concat_ms, table_ms) so callers can log the internal breakdown.
@@ -290,10 +300,10 @@ fn build_suffix_index(objects: &[DiskObject]) -> (SuffixIndex, u128, u128) {
     let concat_ms = concat_start.elapsed().as_millis();
 
     let table_start = Instant::now();
-    let st = SuffixTable::new(buffer);
+    let st = SuffixTable::new(buffer.clone());
     let table_ms = table_start.elapsed().as_millis();
 
-    (SuffixIndex { st, offsets, disk_object_indices }, concat_ms, table_ms)
+    (SuffixIndex { st, offsets, disk_object_indices, buffer }, concat_ms, table_ms)
 }
 
 // Returns None when the index is empty (no candidates to prune) or the query
@@ -581,13 +591,26 @@ fn run_phase2(
         }
     }
 
+    // Folder sizes are now in memory — notify the frontend so it can populate
+    // the "Largest folders" tab without waiting for the DB write.
+    let folder_sizes_ser: HashMap<String, u64> = folder_sizes
+        .iter()
+        .map(|(p, s)| (p.to_string_lossy().to_string(), *s))
+        .collect();
+    let _ = app_bg.emit("scan-folder-sizes-ready", FolderSizesReady {
+        root: root_str.clone(),
+        folder_sizes: folder_sizes_ser,
+    });
+    // User-visible work is done — clear the spinner before the slow DB write.
+    let _ = app_bg.emit("scan-phase-status", "".to_string());
+
     if cancel.load(Ordering::Relaxed) {
         write_debug_log(&state_ptr, &format!("phase2 cancelled after step2 root={}", root_str));
         return;
     }
 
-    // Step 3: persist to SQLite.
-    let _ = app_bg.emit("scan-phase-status", "storing to db...".to_string());
+    // Step 3: persist to SQLite (background, no longer blocks the UI).
+    let update_id = chrono::Utc::now().timestamp_millis();
     let db_open_start = Instant::now();
     let conn = match db::open_db(&db_path_bg) {
         Ok(c) => c,
@@ -602,17 +625,37 @@ fn run_phase2(
     let db_open_ms = db_open_start.elapsed().as_millis();
 
     let db_write_start = Instant::now();
-    let write_result = db::write_scan(&conn, &root_str, &files_bg, &folder_sizes);
+    let write_result = db::write_scan(&conn, &root_str, &files_bg, &folder_sizes, update_id);
     let db_write_ms = db_write_start.elapsed().as_millis();
+
+    // Step 4: persist the suffix index so startup can skip rebuilding it.
+    let index_write_ms = if write_result.is_ok() {
+        let index_arc = {
+            let guard = state_ptr.name_reverse_index.lock().unwrap();
+            guard.get(&root_str).cloned()
+        };
+        if let Some(arc) = index_arc {
+            let idx_start = Instant::now();
+            let _ = db::write_suffix_index_data(
+                &conn, &root_str, update_id,
+                &arc.buffer, &arc.offsets, &arc.disk_object_indices,
+            );
+            idx_start.elapsed().as_millis()
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     let total_ms = total_start.elapsed().as_millis();
 
     match write_result {
         Ok(()) => {
             write_debug_log(&state_ptr, &format!(
-                "phase2 done root={} files={} folders={} sizes_ms={} db_open_ms={} db_write_ms={} total_ms={}",
-                root_str, files_bg.len(), folder_sizes.len(), sizes_ms, db_open_ms, db_write_ms, total_ms,
+                "phase2 done root={} files={} folders={} sizes_ms={} db_open_ms={} db_write_ms={} index_write_ms={} total_ms={}",
+                root_str, files_bg.len(), folder_sizes.len(), sizes_ms, db_open_ms, db_write_ms, index_write_ms, total_ms,
             ));
-            let _ = app_bg.emit("scan-phase-status", "".to_string());
         }
         Err(e) => {
             write_debug_log(&state_ptr, &format!(
@@ -1412,12 +1455,46 @@ pub fn run() {
             for root in roots {
                 let mut objs = db::get_disk_objects_for_root(&conn, &root).unwrap_or_default();
                 objs.sort_by(|a, b| a.path.cmp(&b.path));
+
                 let t_suffix = Instant::now();
-                let (name_index, concat_ms, table_ms) = build_suffix_index(&objs);
+                let meta = db::read_scan_metadata(&conn, &root).ok().flatten();
+                let index_is_current = meta.as_ref().map_or(false, |m| {
+                    m.disk_objects_update_id != 0
+                        && m.suffix_index_update_id == m.disk_objects_update_id
+                });
+
+                let (name_index, index_source) = if index_is_current {
+                    // Try to load the pre-built index from the database.
+                    match db::read_suffix_index_data(&conn, &root) {
+                        Ok(Some((buffer, offsets, disk_object_indices))) => {
+                            let st = SuffixTable::new(buffer.clone());
+                            let idx = SuffixIndex { st, offsets, disk_object_indices, buffer };
+                            (idx, "db")
+                        }
+                        _ => {
+                            let (idx, ..) = build_suffix_index(&objs);
+                            (idx, "rebuild-fallback")
+                        }
+                    }
+                } else {
+                    // Stale or missing: build from disk objects and persist so
+                    // the next startup can skip this step.
+                    let (idx, ..) = build_suffix_index(&objs);
+                    if let Some(m) = &meta {
+                        if m.disk_objects_update_id != 0 {
+                            let _ = db::write_suffix_index_data(
+                                &conn, &root, m.disk_objects_update_id,
+                                &idx.buffer, &idx.offsets, &idx.disk_object_indices,
+                            );
+                        }
+                    }
+                    (idx, "rebuild")
+                };
+
                 let _ = writeln!(
                     std::io::stderr(),
-                    "startup build_suffix_index root={} objects={} concat_ms={} table_ms={} total_ms={}",
-                    root, objs.len(), concat_ms, table_ms, t_suffix.elapsed().as_millis(),
+                    "startup suffix_index root={} objects={} source={} total_ms={}",
+                    root, objs.len(), index_source, t_suffix.elapsed().as_millis(),
                 );
                 disk_objects_map.insert(root.clone(), Arc::new(objs));
                 name_reverse_index_map.insert(root.clone(), Arc::new(name_index));

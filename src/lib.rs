@@ -583,22 +583,44 @@ fn aggregate_folder_sizes(
     root: &Path,
     files: &[FileEntry],
 ) -> HashMap<std::path::PathBuf, u64> {
-    let mut seen: HashSet<FileKey> = HashSet::new();
-    let mut folder_sizes: HashMap<std::path::PathBuf, u64> = HashMap::new();
-    let root_buf = root.to_path_buf();
-    for entry in files {
-        if seen.contains(&entry.file_key) {
-            continue;
-        }
-        seen.insert(entry.file_key);
-        *folder_sizes.entry(root_buf.clone()).or_insert(0) += entry.size;
-        for ancestor in entry.path.ancestors().skip(1) {
-            if !ancestor.starts_with(root) || ancestor == root {
-                break;
-            }
-            *folder_sizes.entry(ancestor.to_path_buf()).or_insert(0) += entry.size;
-        }
-    }
+    let root_len = root.as_os_str().len();
+
+    // Sequential dedup: Rayon workers can't share a HashSet without a lock.
+    let mut seen: HashSet<FileKey> = HashSet::with_capacity(files.len());
+    let unique: Vec<&FileEntry> = files.iter()
+        .filter(|e| seen.insert(e.file_key))
+        .collect();
+
+    // Parallel ancestor walk: each file is independent once dedup is done.
+    // Root size is accumulated as a plain u64 to avoid cloning the root PathBuf per file.
+    let (root_size, mut folder_sizes) = unique
+        .par_iter()
+        .fold(
+            || (0u64, HashMap::<PathBuf, u64>::new()),
+            |(mut rs, mut map), entry| {
+                rs += entry.size;
+                let mut a = entry.path.parent();
+                while let Some(anc) = a {
+                    if anc.as_os_str().len() <= root_len {
+                        break;
+                    }
+                    *map.entry(anc.to_path_buf()).or_insert(0) += entry.size;
+                    a = anc.parent();
+                }
+                (rs, map)
+            },
+        )
+        .reduce(
+            || (0u64, HashMap::new()),
+            |(r1, mut m1), (r2, m2)| {
+                for (k, v) in m2 {
+                    *m1.entry(k).or_insert(0) += v;
+                }
+                (r1 + r2, m1)
+            },
+        );
+
+    folder_sizes.insert(root.to_path_buf(), root_size);
     folder_sizes
 }
 

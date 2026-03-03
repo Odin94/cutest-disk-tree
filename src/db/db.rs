@@ -35,6 +35,7 @@ pub fn write_scan(
     root: &str,
     files: &[FileEntry],
     folder_sizes: &std::collections::HashMap<std::path::PathBuf, u64>,
+    update_id: i64,
 ) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
 
@@ -130,6 +131,18 @@ pub fn write_scan(
             item_params.iter().map(|b| b.as_ref()).collect();
         tx.execute(&sql_items, rusqlite::params_from_iter(item_param_refs))?;
     }
+
+    tx.execute(
+        "INSERT INTO scan_metadata \
+            (root, disk_objects_update_id, disk_objects_last_updated, \
+             suffix_index_update_id, suffix_index_last_updated, \
+             cached_trees_update_id, cached_trees_last_updated) \
+         VALUES (?1, ?2, ?2, 0, 0, 0, 0) \
+         ON CONFLICT(root) DO UPDATE SET \
+            disk_objects_update_id = excluded.disk_objects_update_id, \
+            disk_objects_last_updated = excluded.disk_objects_last_updated",
+        rusqlite::params![root, update_id],
+    )?;
 
     tx.commit()?;
     Ok(())
@@ -469,6 +482,107 @@ pub fn get_root_size(conn: &Connection, root: &str) -> rusqlite::Result<Option<u
     .optional()
 }
 
+#[derive(Debug, Clone)]
+pub struct ScanMetadata {
+    pub disk_objects_update_id: i64,
+    pub disk_objects_last_updated: i64,
+    pub suffix_index_update_id: i64,
+    pub suffix_index_last_updated: i64,
+    pub cached_trees_update_id: i64,
+    pub cached_trees_last_updated: i64,
+}
+
+pub fn read_scan_metadata(
+    conn: &Connection,
+    root: &str,
+) -> rusqlite::Result<Option<ScanMetadata>> {
+    let mut stmt = conn.prepare(
+        "SELECT disk_objects_update_id, disk_objects_last_updated, \
+                suffix_index_update_id, suffix_index_last_updated, \
+                cached_trees_update_id, cached_trees_last_updated \
+         FROM scan_metadata WHERE root = ?1",
+    )?;
+    stmt.query_row([root], |row| {
+        Ok(ScanMetadata {
+            disk_objects_update_id: row.get(0)?,
+            disk_objects_last_updated: row.get(1)?,
+            suffix_index_update_id: row.get(2)?,
+            suffix_index_last_updated: row.get(3)?,
+            cached_trees_update_id: row.get(4)?,
+            cached_trees_last_updated: row.get(5)?,
+        })
+    })
+    .optional()
+}
+
+/// Persists a pre-built suffix index and stamps its `update_id` in
+/// `scan_metadata`. Both writes happen in a single transaction so they
+/// stay consistent if the process is interrupted.
+pub fn write_suffix_index_data(
+    conn: &Connection,
+    root: &str,
+    update_id: i64,
+    buffer: &str,
+    offsets: &[usize],
+    disk_object_indices: &[usize],
+) -> rusqlite::Result<()> {
+    let offsets_blob: Vec<u8> = offsets
+        .iter()
+        .flat_map(|&x| (x as u64).to_le_bytes())
+        .collect();
+    let doi_blob: Vec<u8> = disk_object_indices
+        .iter()
+        .flat_map(|&x| (x as u64).to_le_bytes())
+        .collect();
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT OR REPLACE INTO suffix_index_data (root, buffer, offsets, disk_object_indices) \
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![root, buffer, offsets_blob, doi_blob],
+    )?;
+    tx.execute(
+        "INSERT INTO scan_metadata \
+            (root, disk_objects_update_id, disk_objects_last_updated, \
+             suffix_index_update_id, suffix_index_last_updated, \
+             cached_trees_update_id, cached_trees_last_updated) \
+         VALUES (?1, 0, 0, ?2, ?2, 0, 0) \
+         ON CONFLICT(root) DO UPDATE SET \
+            suffix_index_update_id = excluded.suffix_index_update_id, \
+            suffix_index_last_updated = excluded.suffix_index_last_updated",
+        rusqlite::params![root, update_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Loads a previously persisted suffix index buffer and index maps from the
+/// database. Returns `None` if no data is stored for this root.
+pub fn read_suffix_index_data(
+    conn: &Connection,
+    root: &str,
+) -> rusqlite::Result<Option<(String, Vec<usize>, Vec<usize>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT buffer, offsets, disk_object_indices \
+         FROM suffix_index_data WHERE root = ?1",
+    )?;
+    stmt.query_row([root], |row| {
+        let buffer: String = row.get(0)?;
+        let offsets_blob: Vec<u8> = row.get(1)?;
+        let doi_blob: Vec<u8> = row.get(2)?;
+        let offsets = offsets_blob
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize)
+            .collect();
+        let doi = doi_blob
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize)
+            .collect();
+        Ok((buffer, offsets, doi))
+    })
+    .optional()
+}
+
 pub fn open_db(db_path: &Path) -> rusqlite::Result<Connection> {
     use std::time::Duration;
 
@@ -483,6 +597,11 @@ pub fn open_db(db_path: &Path) -> rusqlite::Result<Connection> {
             other => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(other))),
         };
     }
+
+    // WAL mode keeps readers and the background writer from blocking each other.
+    // synchronous=NORMAL is safe with WAL and avoids the per-commit full fsync
+    // that makes bulk inserts slow on Windows.
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
     // Make concurrent access more robust in the face of background writers.
     // busy_timeout allows SQLite to wait for a short period instead of

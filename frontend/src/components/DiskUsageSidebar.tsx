@@ -108,7 +108,6 @@ export const DiskUsageSidebar = ({
   const displaySize = scan.folder_sizes[displayPath] ?? rootSize;
 
   const renderT0 = performance.now();
-  debugLog(`sidebar_prof sidebar render start displayPath=${displayPath.slice(-50)} t=${renderT0.toFixed(1)}`);
 
   const pathMap = React.useMemo(() => {
     const t0 = performance.now();
@@ -131,8 +130,14 @@ export const DiskUsageSidebar = ({
     return result;
   }, [pathMap, displayPath, scan]);
 
-  const renderMs = (performance.now() - renderT0).toFixed(2);
-  debugLog(`sidebar_prof sidebar render done t=${performance.now().toFixed(1)} totalMs=${renderMs}`);
+  const renderMs = performance.now() - renderT0;
+  if (renderMs > 10) {
+    debugLog(
+      `sidebar_prof sidebar render slow t=${performance.now().toFixed(1)} totalMs=${renderMs.toFixed(
+        2
+      )} displayPath=${displayPath.slice(-50)}`
+    );
+  }
 
   return (
     <aside className="disk-usage-sidebar">

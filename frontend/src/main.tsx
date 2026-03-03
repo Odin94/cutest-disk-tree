@@ -9,9 +9,9 @@ getDebugLogPath()
     debugLog(`app started debug_log_path=${path}`);
     debugLogStats("start");
   })
-  .catch(() => {});
+  .catch(() => { });
 
-const DEBUG_STATS_INTERVAL_MS = 5000;
+const DEBUG_STATS_INTERVAL_MS = 15000;
 setInterval(() => {
   debugLogStats("tick");
 }, DEBUG_STATS_INTERVAL_MS);

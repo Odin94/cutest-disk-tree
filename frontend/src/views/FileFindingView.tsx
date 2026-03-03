@@ -47,7 +47,6 @@ const FindResultsTable = memo(({
   onToggleSort,
 }: FindResultsTableProps) => {
   const renderT0 = performance.now();
-  debugLog(`find_ui FindResultsTable render start rows=${visibleSearchResults.length}`);
   const out = (
     <div className="find-table-wrap">
       <Table className="find-table">
@@ -152,7 +151,12 @@ const FindResultsTable = memo(({
       </Table>
     </div>
   );
-  debugLog(`find_ui FindResultsTable render done ms=${(performance.now() - renderT0).toFixed(1)}`);
+  const renderMs = performance.now() - renderT0;
+  if (renderMs > 10) {
+    debugLog(
+      `find_ui FindResultsTable render slow ms=${renderMs.toFixed(1)} rows=${visibleSearchResults.length}`
+    );
+  }
   return out;
 });
 FindResultsTable.displayName = "FindResultsTable";
@@ -757,9 +761,12 @@ export const FileFindingView = ({
     </>
   );
 
-  debugLog(
-    `find_ui FileFindingView render done ms=${(performance.now() - renderT0).toFixed(1)}`
-  );
+  const renderMs = performance.now() - renderT0;
+  if (renderMs > 10) {
+    debugLog(
+      `find_ui FileFindingView render slow ms=${renderMs.toFixed(1)} query_len=${searchQuery.length} results=${searchResults.length} loading=${searchLoading}`
+    );
+  }
 
   return view;
 };

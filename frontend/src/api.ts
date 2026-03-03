@@ -36,6 +36,13 @@ export const onScanProgress = (callback: (progress: ScanProgress) => void) => {
   return unlisten;
 };
 
+export const onScanPhaseStatus = (callback: (status: string) => void) => {
+  const unlisten = listen<string>("scan-phase-status", (event) => {
+    callback(event.payload);
+  });
+  return unlisten;
+};
+
 export const listCachedRoots = (): Promise<string[]> =>
   invoke("list_cached_roots", {});
 

@@ -439,16 +439,6 @@ fn is_symlink(entry: &DirEntry) -> bool {
     entry.path_is_symlink()
 }
 
-fn path_ancestors(path: &Path) -> Vec<PathBuf> {
-    let mut ancestors = Vec::new();
-    let mut current = path.to_path_buf();
-    while current.pop() {
-        if !current.as_os_str().is_empty() {
-            ancestors.push(current.clone());
-        }
-    }
-    ancestors
-}
 
 #[derive(Clone, Debug)]
 pub struct FileEntry {
@@ -602,10 +592,11 @@ fn aggregate_folder_sizes(
         }
         seen.insert(entry.file_key);
         *folder_sizes.entry(root_buf.clone()).or_insert(0) += entry.size;
-        for ancestor in path_ancestors(&entry.path) {
-            if ancestor != root_buf && ancestor.starts_with(root) {
-                *folder_sizes.entry(ancestor).or_insert(0) += entry.size;
+        for ancestor in entry.path.ancestors().skip(1) {
+            if !ancestor.starts_with(root) || ancestor == root {
+                break;
             }
+            *folder_sizes.entry(ancestor.to_path_buf()).or_insert(0) += entry.size;
         }
     }
     folder_sizes
@@ -950,8 +941,12 @@ pub fn index_directory_lolcate_like(root: &Path, _mode: IndexMode) -> IndexStats
 /// Ignore-based parallel indexer used for the main application scan path.
 ///
 /// Collects files with path, size and last-modified timestamp, and reports
-/// progress periodically. Folder sizes are computed separately.
-pub fn index_directory_ignore_with_progress<F>(root: &Path, progress: F) -> Vec<FileEntry>
+/// progress periodically. Also collects folder paths seen during the walk.
+/// Folder sizes are computed separately.
+pub fn index_directory_ignore_with_progress<F>(
+    root: &Path,
+    progress: F,
+) -> (Vec<FileEntry>, std::collections::HashSet<std::path::PathBuf>)
 where
     F: FnMut(ScanProgress) + Send,
 {
@@ -978,11 +973,14 @@ where
         .threads(4);
 
     let files_acc: Arc<Mutex<Vec<FileEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let folders_acc: Arc<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
     let counter = Arc::new(AtomicUsize::new(0));
 
     let walk = builder.build_parallel();
     walk.run(|| {
         let files_acc = Arc::clone(&files_acc);
+        let folders_acc = Arc::clone(&folders_acc);
         let counter = Arc::clone(&counter);
         let progress = Arc::clone(&progress);
         Box::new(move |entry| {
@@ -996,6 +994,12 @@ where
                 None => return WalkState::Continue,
             };
             if ft.is_symlink() {
+                return WalkState::Continue;
+            }
+            if ft.is_dir() {
+                if let Ok(mut guard) = folders_acc.lock() {
+                    guard.insert(entry.path().to_path_buf());
+                }
                 return WalkState::Continue;
             }
             if !ft.is_file() {
@@ -1047,6 +1051,10 @@ where
         Ok(mutex) => mutex.into_inner().unwrap(),
         Err(arc) => arc.lock().unwrap().clone(),
     };
+    let folders = match Arc::try_unwrap(folders_acc) {
+        Ok(mutex) => mutex.into_inner().unwrap(),
+        Err(arc) => arc.lock().unwrap().clone(),
+    };
 
     if let Ok(mut cb) = progress.lock() {
         cb(ScanProgress {
@@ -1056,7 +1064,7 @@ where
         });
     }
 
-    files
+    (files, folders)
 }
 
 pub fn index_directory_lolcate_full(
@@ -1136,16 +1144,6 @@ pub fn index_directory_lolcate_full(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::path::PathBuf;
-
-    #[test]
-    fn path_ancestors_works() {
-        let p = PathBuf::from("/a/b/c/file.txt");
-        let a = path_ancestors(&p);
-        assert!(a.iter().any(|x| *x == PathBuf::from("/a/b/c")));
-        assert!(a.iter().any(|x| *x == PathBuf::from("/a/b")));
-        assert!(a.iter().any(|x| *x == PathBuf::from("/a")));
-    }
 
     #[test]
     fn build_disk_tree_creates_expected_structure() {

@@ -38,58 +38,16 @@ pub fn write_scan(
 ) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
 
-    tx.execute("DELETE FROM files WHERE root = ?1", [root])?;
-    tx.execute("DELETE FROM folders WHERE root = ?1", [root])?;
+    tx.execute("DELETE FROM disk_objects WHERE root = ?1", [root])?;
     tx.execute("DELETE FROM cached_trees WHERE root = ?1", [root])?;
     tx.execute("DELETE FROM file_search_trigrams WHERE root = ?1", [root])?;
-    tx.execute("DELETE FROM items WHERE root = ?1", [root])?;
-
     for chunk in files.chunks(BATCH_SIZE) {
-        let row_placeholders = (0..chunk.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO files (root, path, size, dev, ino, hash, mtime, name, type, parent_path) VALUES {}",
-            row_placeholders
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> =
-            Vec::with_capacity(chunk.len() * 10);
-        for entry in chunk {
-            let path_str = entry.path.to_string_lossy().to_string();
-            let parent_path = parent_dir(&path_str);
-            let name: Option<String> = entry
-                .path
-                .file_name()
-                .and_then(|os| os.to_str())
-                .map(|s| s.to_string());
-            let file_type: Option<String> = entry
-                .path
-                .extension()
-                .and_then(|os| os.to_str())
-                .map(|s| s.to_ascii_lowercase());
-
-            params.push(Box::new(root));
-            params.push(Box::new(path_str));
-            params.push(Box::new(entry.size as i64));
-            params.push(Box::new(entry.file_key.dev as i64));
-            params.push(Box::new(entry.file_key.ino as i64));
-            params.push(Box::new(None::<String>));
-            params.push(Box::new(entry.mtime.unwrap_or(0)));
-            params.push(Box::new(name));
-            params.push(Box::new(file_type));
-            params.push(Box::new(parent_path));
-        }
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(|b| b.as_ref()).collect();
-        tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
-
         let row_placeholders_items = (0..chunk.len())
             .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .collect::<Vec<_>>()
             .join(", ");
         let sql_items = format!(
-            "INSERT INTO items (root, path, path_lower, parent_path, name, name_lower, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
+            "INSERT INTO disk_objects (root, path, path_lower, parent_path, name, name_lower, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
             row_placeholders_items
         );
         let mut item_params: Vec<Box<dyn rusqlite::ToSql + '_>> =
@@ -133,30 +91,12 @@ pub fn write_scan(
 
     let folder_vec: Vec<_> = folder_sizes.iter().collect();
     for chunk in folder_vec.chunks(BATCH_SIZE) {
-        let row_placeholders = (0..chunk.len()).map(|_| "(?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "INSERT INTO folders (root, path, recursive_size, parent_path) VALUES {}",
-            row_placeholders
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql + '_>> = Vec::with_capacity(chunk.len() * 4);
-        for (path, size) in chunk.iter() {
-            let path_str = path.to_string_lossy().to_string();
-            let parent_path = parent_dir(&path_str);
-            params.push(Box::new(root));
-            params.push(Box::new(path_str));
-            params.push(Box::new(**size as i64));
-            params.push(Box::new(parent_path));
-        }
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-        tx.execute(&sql, rusqlite::params_from_iter(param_refs))?;
-
-        // Also populate unified items table for folders
         let row_placeholders_items = (0..chunk.len())
             .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .collect::<Vec<_>>()
             .join(", ");
         let sql_items = format!(
-            "INSERT INTO items (root, path, path_lower, parent_path, name, name_lower, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
+            "INSERT INTO disk_objects (root, path, path_lower, parent_path, name, name_lower, ext, kind, size, recursive_size, dev, ino, mtime) VALUES {}",
             row_placeholders_items
         );
         let mut item_params: Vec<Box<dyn rusqlite::ToSql + '_>> =
@@ -196,7 +136,7 @@ pub fn write_scan(
 }
 
 pub fn list_roots(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT DISTINCT root FROM folders ORDER BY root")?;
+    let mut stmt = conn.prepare("SELECT DISTINCT root FROM disk_objects ORDER BY root")?;
     let rows = stmt.query_map([], |row| row.get(0))?;
     rows.collect()
 }
@@ -206,7 +146,7 @@ pub fn get_file_index(
     root: &str,
 ) -> rusqlite::Result<Vec<(String, u64, u64, u64, Option<String>)>> {
     let mut stmt = conn.prepare(
-        "SELECT path, size, dev, ino, type FROM files WHERE root = ?1",
+        "SELECT path, size, dev, ino, ext FROM disk_objects WHERE root = ?1 AND kind = 'file'",
     )?;
     let rows = stmt.query_map([root], |row| {
         Ok((
@@ -226,7 +166,7 @@ pub fn get_disk_objects_for_root(
 ) -> rusqlite::Result<Vec<crate::DiskObject>> {
     let mut stmt = conn.prepare(
         "SELECT path, path_lower, parent_path, name, name_lower, ext, kind, size, recursive_size, dev, ino, mtime \
-         FROM items WHERE root = ?1",
+         FROM disk_objects WHERE root = ?1",
     )?;
     let rows = stmt.query_map([root], |row| {
         let kind_str: String = row.get(6)?;
@@ -277,9 +217,9 @@ pub fn search_files_by_substring(
     }
 
     let mut sql = String::from(
-        "SELECT f.path, f.size, f.dev, f.ino, f.type \
+        "SELECT f.path, f.size, f.dev, f.ino, f.ext \
          FROM file_search_trigrams t \
-         JOIN files f ON f.root = t.root AND f.path = t.path \
+         JOIN disk_objects f ON f.root = t.root AND f.path = t.path \
          WHERE t.root = ?1 AND t.trigram IN (",
     );
 
@@ -293,7 +233,7 @@ pub fn search_files_by_substring(
     let mut ext_values: Vec<String> = Vec::new();
     if let Some(set) = extension_set {
         if !set.is_empty() {
-            sql.push_str(" AND f.type IN (");
+            sql.push_str(" AND f.ext IN (");
             let mut ext_placeholders: Vec<String> = Vec::with_capacity(set.len());
             for i in 0..set.len() {
                 ext_placeholders.push(format!("?{}", trigrams.len() + 2 + i));
@@ -309,7 +249,7 @@ pub fn search_files_by_substring(
 
     sql.push_str(
         &format!(
-            " GROUP BY f.path, f.size, f.dev, f.ino, f.type \
+            " GROUP BY f.path, f.size, f.dev, f.ino, f.ext \
                HAVING COUNT(*) >= ?{} \
                ORDER BY f.path \
                LIMIT ?{}",
@@ -357,7 +297,7 @@ pub fn get_folders_for_root(
     root: &str,
 ) -> rusqlite::Result<Vec<(String, u64)>> {
     let mut stmt = conn.prepare(
-        "SELECT path, recursive_size FROM folders WHERE root = ?1",
+        "SELECT path, recursive_size FROM disk_objects WHERE root = ?1 AND kind = 'folder'",
     )?;
     let rows = stmt
         .query_map([root], |row| {
@@ -381,18 +321,18 @@ pub fn get_scan_result_timed(
 ) -> rusqlite::Result<(Option<crate::ScanResult>, GetScanTimings)> {
     let mut timings = GetScanTimings::default();
 
-    let file_count: i64 = conn.query_row(
-        "SELECT COUNT(1) FROM files WHERE root = ?1",
+    let object_count: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM disk_objects WHERE root = ?1",
         [root],
         |row| row.get(0),
     )?;
-    if file_count == 0 {
+    if object_count == 0 {
         return Ok((None, timings));
     }
 
     let t0 = Instant::now();
     let mut file_stmt = conn.prepare(
-        "SELECT path, size, dev, ino, mtime FROM files WHERE root = ?1 ORDER BY path",
+        "SELECT path, size, dev, ino, mtime FROM disk_objects WHERE root = ?1 AND kind = 'file' ORDER BY path",
     )?;
     let files: Vec<crate::FileEntrySer> = file_stmt
         .query_map([root], |row| {
@@ -411,7 +351,7 @@ pub fn get_scan_result_timed(
 
     let t1 = Instant::now();
     let mut folder_stmt = conn.prepare(
-        "SELECT path, recursive_size FROM folders WHERE root = ?1 ORDER BY recursive_size DESC",
+        "SELECT path, recursive_size FROM disk_objects WHERE root = ?1 AND kind = 'folder' ORDER BY recursive_size DESC",
     )?;
     let folder_sizes: std::collections::HashMap<String, u64> = folder_stmt
         .query_map([root], |row| {
@@ -500,7 +440,7 @@ pub fn get_children_for_path(
     Vec<(String, u64)>,
 )> {
     let mut folder_stmt = conn.prepare(
-        "SELECT path, recursive_size FROM folders WHERE root = ?1 AND parent_path = ?2 ORDER BY recursive_size DESC",
+        "SELECT path, recursive_size FROM disk_objects WHERE root = ?1 AND parent_path = ?2 AND kind = 'folder' ORDER BY recursive_size DESC",
     )?;
     let folders: Vec<(String, u64)> = folder_stmt
         .query_map(rusqlite::params![root, parent_path], |row| {
@@ -509,7 +449,7 @@ pub fn get_children_for_path(
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut file_stmt = conn.prepare(
-        "SELECT path, size FROM files WHERE root = ?1 AND parent_path = ?2",
+        "SELECT path, size FROM disk_objects WHERE root = ?1 AND parent_path = ?2 AND kind = 'file'",
     )?;
     let files: Vec<(String, u64)> = file_stmt
         .query_map(rusqlite::params![root, parent_path], |row| {
@@ -522,7 +462,7 @@ pub fn get_children_for_path(
 
 pub fn get_root_size(conn: &Connection, root: &str) -> rusqlite::Result<Option<u64>> {
     conn.query_row(
-        "SELECT recursive_size FROM folders WHERE root = ?1 AND path = ?2",
+        "SELECT recursive_size FROM disk_objects WHERE root = ?1 AND path = ?2 AND kind = 'folder'",
         rusqlite::params![root, root],
         |row| row.get::<_, i64>(0).map(|n| n as u64),
     )

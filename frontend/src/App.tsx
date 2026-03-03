@@ -1,5 +1,5 @@
-import { useState, useRef } from "react";
-import { scanDirectory, pickDirectory, onScanProgress, loadCachedScan, debugLog } from "./api";
+import { useState, useRef, useEffect } from "react";
+import { scanDirectory, pickDirectory, onScanProgress, loadCachedScan, debugLog, onScanPhaseStatus } from "./api";
 import type { ScanResult, ScanProgress } from "./types";
 import "./App.css";
 import { DiskUsageView } from "./views/DiskUsageView";
@@ -58,7 +58,9 @@ const App = () => {
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [scanRootPath, setScanRootPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [scanPhaseStatus, setScanPhaseStatus] = useState<string>("");
   const unlistenRef = useRef<(() => void) | null>(null);
+  const phaseStatusUnlistenRef = useRef<(() => void) | null>(null);
   const scanCancelRef = useRef(false);
   const progressLogTimeRef = useRef(0);
   const PROGRESS_LOG_INTERVAL_MS = 2000;
@@ -105,6 +107,10 @@ const App = () => {
         unlistenRef.current();
         unlistenRef.current = null;
       }
+      if (phaseStatusUnlistenRef.current) {
+        phaseStatusUnlistenRef.current();
+        phaseStatusUnlistenRef.current = null;
+      }
       setLoading(false);
       setProgress(null);
       setScanRootPath(null);
@@ -118,10 +124,35 @@ const App = () => {
       unlistenRef.current();
       unlistenRef.current = null;
     }
+    if (phaseStatusUnlistenRef.current) {
+      phaseStatusUnlistenRef.current();
+      phaseStatusUnlistenRef.current = null;
+    }
     setLoading(false);
     setProgress(null);
     setScanRootPath(null);
   };
+
+  useEffect(() => {
+    let isMounted = true;
+    onScanPhaseStatus((status) => {
+      if (!isMounted) return;
+      setScanPhaseStatus(status);
+    }).then((unlisten) => {
+      if (!isMounted) {
+        unlisten();
+      } else {
+        phaseStatusUnlistenRef.current = unlisten;
+      }
+    });
+    return () => {
+      isMounted = false;
+      if (phaseStatusUnlistenRef.current) {
+        phaseStatusUnlistenRef.current();
+        phaseStatusUnlistenRef.current = null;
+      }
+    };
+  }, []);
 
   const handleSelectCachedRoot = async (root: string) => {
     debugLog(`App handleSelectCachedRoot root=${root}`);
@@ -142,6 +173,12 @@ const App = () => {
       <header className="header">
         <h1>Cutest Disk Tree</h1>
         <div className="header-actions">
+          {scanPhaseStatus !== "" ? (
+            <div className="scan-phase-indicator">
+              <span className="scan-phase-spinner" />
+              <span className="scan-phase-label">{scanPhaseStatus}</span>
+            </div>
+          ) : null}
           <CheckForUpdatesButton />
         </div>
       </header>

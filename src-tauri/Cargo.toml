@@ -18,6 +18,7 @@ chrono = "0.4"
 sysinfo = "0.31"
 nucleo = "0.5"
 rusqlite = { version = "0.32", features = ["bundled"] }
+suffix = "1"
 dotenvy = "0.15"
 
 [features]

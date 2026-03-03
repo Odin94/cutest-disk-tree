@@ -1,7 +1,9 @@
 use cutest_disk_tree::{db, DiskObject, DiskObjectKind};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use suffix::SuffixTable;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::process;
 use std::time::Instant;
 use tauri::Manager;
@@ -173,9 +175,11 @@ struct AppState {
     db_path: std::path::PathBuf,
     debug_log: Mutex<Option<std::path::PathBuf>>,
     disk_objects: Mutex<HashMap<String, Arc<Vec<DiskObject>>>>,
-    name_reverse_index: Mutex<HashMap<String, Arc<NameReverseIndex>>>,
+    name_reverse_index: Mutex<HashMap<String, Arc<SuffixIndex>>>,
+    phase2_cancel: Mutex<Arc<AtomicBool>>,
 }
 
+#[allow(dead_code)]
 fn make_trigrams(s: &str) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() < 3 {
@@ -188,6 +192,7 @@ fn make_trigrams(s: &str) -> Vec<String> {
     out
 }
 
+#[allow(dead_code)]
 fn make_bigrams(s: &str) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() < 2 {
@@ -200,64 +205,43 @@ fn make_bigrams(s: &str) -> Vec<String> {
     out
 }
 
-fn make_unigrams(s: &str) -> Vec<String> {
-    s.chars().map(|c| c.to_string()).collect()
-}
-
+#[allow(dead_code)]
 struct NameReverseIndex {
     trigram_to_indices: HashMap<String, HashSet<usize>>,
-    bigram_to_indices: HashMap<String, HashSet<usize>>,
-    unigram_to_indices: HashMap<String, HashSet<usize>>,
 }
 
+#[allow(dead_code)]
 fn build_name_reverse_index(objects: &[DiskObject]) -> NameReverseIndex {
     let mut trigram_to_indices: HashMap<String, HashSet<usize>> = HashMap::new();
-    let mut bigram_to_indices: HashMap<String, HashSet<usize>> = HashMap::new();
-    let mut unigram_to_indices: HashMap<String, HashSet<usize>> = HashMap::new();
     for (i, o) in objects.iter().enumerate() {
-        let s = o.name.to_ascii_lowercase();
+        if !matches!(o.kind, DiskObjectKind::File) {
+            continue;
+        }
+        let s = o.name_lower.to_ascii_lowercase();
         for t in make_trigrams(&s) {
             trigram_to_indices.entry(t).or_default().insert(i);
-        }
-        for b in make_bigrams(&s) {
-            bigram_to_indices.entry(b).or_default().insert(i);
-        }
-        for u in make_unigrams(&s) {
-            unigram_to_indices.entry(u).or_default().insert(i);
         }
     }
     NameReverseIndex {
         trigram_to_indices,
-        bigram_to_indices,
-        unigram_to_indices,
     }
 }
 
+#[allow(dead_code)]
 fn candidate_indices_from_reverse_index(
     index: &NameReverseIndex,
     q_lower: &str,
 ) -> Option<HashSet<usize>> {
     let chars_count = q_lower.chars().count();
-    let tokens: Vec<String> = if chars_count >= 3 {
-        make_trigrams(q_lower)
-    } else if chars_count >= 2 {
-        make_bigrams(q_lower)
-    } else if chars_count >= 1 {
-        make_unigrams(q_lower)
-    } else {
+    if chars_count < 3 {
         return None;
-    };
+    }
+    let tokens: Vec<String> = make_trigrams(q_lower);
     if tokens.is_empty() {
         return None;
     }
     let mut candidate_set: Option<HashSet<usize>> = None;
-    let map = if chars_count >= 3 {
-        &index.trigram_to_indices
-    } else if chars_count >= 2 {
-        &index.bigram_to_indices
-    } else {
-        &index.unigram_to_indices
-    };
+    let map = &index.trigram_to_indices;
     for t in &tokens {
         let set = map.get(t)?;
         candidate_set = Some(match candidate_set {
@@ -269,6 +253,71 @@ fn candidate_indices_from_reverse_index(
         }
     }
     candidate_set
+}
+
+// Suffix-array based file name index.
+//
+// `buffer` is a single string of all indexed file names in lowercase, each
+// separated by a '\0' byte so that queries cannot bleed across name boundaries.
+// `offsets[i]` is the byte offset in `buffer` where the i-th indexed file's
+// name starts, and `disk_object_indices[i]` is that file's position in the
+// parent `Vec<DiskObject>`.  The two vecs are parallel and both sorted by
+// ascending offset.
+struct SuffixIndex {
+    st: SuffixTable<'static, 'static>,
+    offsets: Vec<usize>,
+    disk_object_indices: Vec<usize>,
+}
+
+// Returns (index, concat_ms, table_ms) so callers can log the internal breakdown.
+// concat_ms  = time to build the concatenated name buffer + offset vecs
+// table_ms   = time to construct the suffix array (O(n log n), the expensive part)
+fn build_suffix_index(objects: &[DiskObject]) -> (SuffixIndex, u128, u128) {
+    let concat_start = Instant::now();
+    let mut buffer = String::with_capacity(objects.len() * 16);
+    let mut offsets: Vec<usize> = Vec::with_capacity(objects.len());
+    let mut disk_object_indices: Vec<usize> = Vec::with_capacity(objects.len());
+
+    for (i, o) in objects.iter().enumerate() {
+        if !matches!(o.kind, DiskObjectKind::File) {
+            continue;
+        }
+        offsets.push(buffer.len());
+        disk_object_indices.push(i);
+        buffer.push_str(&o.name_lower);
+        buffer.push('\0');
+    }
+    let concat_ms = concat_start.elapsed().as_millis();
+
+    let table_start = Instant::now();
+    let st = SuffixTable::new(buffer);
+    let table_ms = table_start.elapsed().as_millis();
+
+    (SuffixIndex { st, offsets, disk_object_indices }, concat_ms, table_ms)
+}
+
+// Returns None when the index is empty (no candidates to prune) or the query
+// is empty.  Returns Some(empty set) when no names match.  Otherwise returns
+// Some with the set of disk_objects indices whose names contain `q_lower`.
+fn search_suffix_index(index: &SuffixIndex, q_lower: &str) -> Option<HashSet<usize>> {
+    if q_lower.is_empty() || index.offsets.is_empty() {
+        return None;
+    }
+
+    let positions = index.st.positions(q_lower);
+
+    if positions.is_empty() {
+        return Some(HashSet::new());
+    }
+
+    let mut result: HashSet<usize> = HashSet::new();
+    for &pos in positions {
+        let pos = pos as usize;
+        // Find the last offset that is <= pos: that is the file owning this position.
+        let local_idx = index.offsets.partition_point(|&x| x <= pos) - 1;
+        result.insert(index.disk_object_indices[local_idx]);
+    }
+    Some(result)
 }
 
 fn write_debug_log(state: &AppState, message: &str) {
@@ -341,6 +390,239 @@ fn debug_log_stats(state: tauri::State<AppState>, message: String) -> Result<(),
     Ok(())
 }
 
+// Shared constructor that derives all path-based fields from a raw path string,
+// eliminating duplicated decomposition logic across the scan phases.
+fn make_disk_object_from_path(
+    root: &str,
+    path_string: String,
+    kind: DiskObjectKind,
+    size: Option<u64>,
+    recursive_size: Option<u64>,
+    dev: Option<u64>,
+    ino: Option<u64>,
+    mtime: Option<i64>,
+) -> DiskObject {
+    let path_lower = path_string.to_ascii_lowercase();
+    let parent = cutest_disk_tree::parent_dir(&path_string);
+    let name = std::path::Path::new(&path_string)
+        .file_name()
+        .and_then(|os| os.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path_string.clone());
+    let name_lower = name.to_ascii_lowercase();
+    let ext = match kind {
+        DiskObjectKind::File => std::path::Path::new(&path_string)
+            .extension()
+            .and_then(|os| os.to_str())
+            .map(|s| s.to_ascii_lowercase()),
+        DiskObjectKind::Folder => None,
+    };
+    DiskObject {
+        root: root.to_string(),
+        path: path_string,
+        path_lower,
+        parent_path: if parent.is_empty() { None } else { Some(parent) },
+        name,
+        name_lower,
+        ext,
+        kind,
+        size,
+        recursive_size,
+        dev,
+        ino,
+        mtime,
+    }
+}
+
+// Build the initial Vec<DiskObject> for a root from raw walker output.
+// Files and folders are both included and come directly from the walker —
+// folders do not have recursive sizes yet (those are added by apply_folder_sizes).
+fn build_disk_objects(
+    root: &str,
+    files: &[cutest_disk_tree::FileEntry],
+    folder_paths: &std::collections::HashSet<std::path::PathBuf>,
+) -> Vec<DiskObject> {
+    let mut objs: Vec<DiskObject> = Vec::with_capacity(files.len() + folder_paths.len());
+    for f in files {
+        objs.push(make_disk_object_from_path(
+            root,
+            f.path.to_string_lossy().into_owned(),
+            DiskObjectKind::File,
+            Some(f.size),
+            None,
+            Some(f.file_key.dev),
+            Some(f.file_key.ino),
+            f.mtime,
+        ));
+    }
+    for folder in folder_paths {
+        objs.push(make_disk_object_from_path(
+            root,
+            folder.to_string_lossy().into_owned(),
+            DiskObjectKind::Folder,
+            None, None, None, None, None,
+        ));
+    }
+    objs.sort_by(|a, b| a.path.cmp(&b.path));
+    objs
+}
+
+// Back-fill recursive folder sizes (computed in the background phase) into an
+// existing DiskObject vec.  Folders present in folder_sizes but missing from
+// objs (can happen when the size-walk discovers additional dirs) are inserted.
+fn apply_folder_sizes(
+    mut objs: Vec<DiskObject>,
+    folder_sizes: &HashMap<std::path::PathBuf, u64>,
+    root: &str,
+) -> Vec<DiskObject> {
+    let mut path_to_index: HashMap<String, usize> = HashMap::new();
+    for (i, o) in objs.iter().enumerate() {
+        if matches!(o.kind, DiskObjectKind::Folder) {
+            path_to_index.insert(o.path.clone(), i);
+        }
+    }
+    for (p, &s) in folder_sizes {
+        let path_string = p.to_string_lossy().into_owned();
+        if let Some(&idx) = path_to_index.get(&path_string) {
+            objs[idx].recursive_size = Some(s);
+        } else {
+            objs.push(make_disk_object_from_path(
+                root, path_string, DiskObjectKind::Folder,
+                None, Some(s), None, None, None,
+            ));
+        }
+    }
+    objs.sort_by(|a, b| a.path.cmp(&b.path));
+    objs
+}
+
+// Phase 1b: convert raw scan results into DiskObjects (files + folders together),
+// build the suffix index, and install both into AppState.  After this returns,
+// find_files is fully operational for the root.
+fn activate_initial_index(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    root: &str,
+    files: &[cutest_disk_tree::FileEntry],
+    folder_paths: &std::collections::HashSet<std::path::PathBuf>,
+) {
+    let t0 = Instant::now();
+    let _ = app.emit("scan-phase-status", "building search index...".to_string());
+
+    let build_start = Instant::now();
+    let objs = build_disk_objects(root, files, folder_paths);
+    let build_ms = build_start.elapsed().as_millis();
+
+    let (index, suffix_concat_ms, suffix_table_ms) = build_suffix_index(&objs);
+
+    write_debug_log(state, &format!(
+        "activate_initial_index done root={} files={} folders={} objects={} build_disk_objs_ms={} suffix_concat_ms={} suffix_table_ms={} total_ms={}",
+        root, files.len(), folder_paths.len(), objs.len(), build_ms, suffix_concat_ms, suffix_table_ms, t0.elapsed().as_millis(),
+    ));
+
+    {
+        let mut disk_map = state.disk_objects.lock().unwrap();
+        disk_map.insert(root.to_string(), Arc::new(objs));
+        let mut idx_map = state.name_reverse_index.lock().unwrap();
+        idx_map.insert(root.to_string(), Arc::new(index));
+    }
+    let _ = app.emit("scan-phase-status", "".to_string());
+}
+
+// Phase 2 (background): compute recursive folder sizes, update the DiskObject
+// vec with those sizes, then persist everything to SQLite.
+fn run_phase2(
+    app_bg: tauri::AppHandle,
+    db_path_bg: std::path::PathBuf,
+    root_str: String,
+    root_buf: std::path::PathBuf,
+    files_bg: Vec<cutest_disk_tree::FileEntry>,
+    cancel: Arc<AtomicBool>,
+) {
+    let state_ptr: tauri::State<AppState> = app_bg.state();
+    let total_start = Instant::now();
+
+    // Step 1: compute recursive folder sizes.
+    let _ = app_bg.emit("scan-phase-status", "aggregating folder sizes...".to_string());
+    let sizes_start = Instant::now();
+    let folder_sizes = cutest_disk_tree::compute_folder_sizes(&root_buf, &files_bg);
+    let sizes_ms = sizes_start.elapsed().as_millis();
+    write_debug_log(&state_ptr, &format!(
+        "phase2 folder_sizes_done root={} folders={} ms={}",
+        root_str, folder_sizes.len(), sizes_ms,
+    ));
+
+    if cancel.load(Ordering::Relaxed) {
+        write_debug_log(&state_ptr, &format!("phase2 cancelled after step1 root={}", root_str));
+        return;
+    }
+
+    // Step 2: apply folder sizes to the DiskObject vec.
+    // The suffix index built in phase 1b only indexes file names, which haven't
+    // changed, so it stays valid and does not need to be rebuilt here.
+    let _ = app_bg.emit("scan-phase-status", "updating search index...".to_string());
+    let existing_arc = {
+        let guard = state_ptr.disk_objects.lock().unwrap();
+        guard.get(&root_str).cloned()
+    };
+    if let Some(arc) = existing_arc {
+        let apply_start = Instant::now();
+        let new_objs = apply_folder_sizes((*arc).clone(), &folder_sizes, &root_str);
+        let apply_ms = apply_start.elapsed().as_millis();
+
+        write_debug_log(&state_ptr, &format!(
+            "phase2 index_updated root={} objects={} apply_folder_sizes_ms={} total_ms={}",
+            root_str, new_objs.len(), apply_ms, total_start.elapsed().as_millis(),
+        ));
+
+        {
+            let mut disk_map = state_ptr.disk_objects.lock().unwrap();
+            disk_map.insert(root_str.clone(), Arc::new(new_objs));
+        }
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        write_debug_log(&state_ptr, &format!("phase2 cancelled after step2 root={}", root_str));
+        return;
+    }
+
+    // Step 3: persist to SQLite.
+    let _ = app_bg.emit("scan-phase-status", "storing to db...".to_string());
+    let db_open_start = Instant::now();
+    let conn = match db::open_db(&db_path_bg) {
+        Ok(c) => c,
+        Err(e) => {
+            write_debug_log(&state_ptr, &format!(
+                "phase2 db_open_failed root={} error={} total_ms={}",
+                root_str, e, total_start.elapsed().as_millis(),
+            ));
+            return;
+        }
+    };
+    let db_open_ms = db_open_start.elapsed().as_millis();
+
+    let db_write_start = Instant::now();
+    let write_result = db::write_scan(&conn, &root_str, &files_bg, &folder_sizes);
+    let db_write_ms = db_write_start.elapsed().as_millis();
+    let total_ms = total_start.elapsed().as_millis();
+
+    match write_result {
+        Ok(()) => {
+            write_debug_log(&state_ptr, &format!(
+                "phase2 done root={} files={} folders={} sizes_ms={} db_open_ms={} db_write_ms={} total_ms={}",
+                root_str, files_bg.len(), folder_sizes.len(), sizes_ms, db_open_ms, db_write_ms, total_ms,
+            ));
+            let _ = app_bg.emit("scan-phase-status", "".to_string());
+        }
+        Err(e) => {
+            write_debug_log(&state_ptr, &format!(
+                "phase2 db_write_failed root={} error={} sizes_ms={} db_open_ms={} db_write_ms={} total_ms={}",
+                root_str, e, sizes_ms, db_open_ms, db_write_ms, total_ms,
+            ));
+        }
+    }
+}
+
 #[tauri::command]
 async fn scan_directory(
     app: tauri::AppHandle,
@@ -355,236 +637,65 @@ async fn scan_directory(
         return Err(e);
     }
     let db_path = state.db_path.clone();
-    let path_for_db = path.clone();
 
-    // Phase 1: fast in-memory scan using the ignore-based walker.
+    // Phase 1: parallel filesystem walk (blocking).
     let root_for_scan = path_buf.clone();
     let app_for_scan = app.clone();
-    let (result, files) = match tauri::async_runtime::spawn_blocking(move || {
-        let files =
+    let scan_start = Instant::now();
+    let (result, files, folder_paths) = match tauri::async_runtime::spawn_blocking(move || {
+        let (files, folder_paths) =
             cutest_disk_tree::index_directory_ignore_with_progress(&root_for_scan, |p| {
                 let _ = app_for_scan.emit("scan-progress", &p);
             });
-        // For the immediate response, we don't include recursive folder sizes yet.
-        let empty_folder_sizes: std::collections::HashMap<std::path::PathBuf, u64> =
-            std::collections::HashMap::new();
+        let empty_folder_sizes: HashMap<std::path::PathBuf, u64> = HashMap::new();
         let result =
             cutest_disk_tree::to_scan_result(&root_for_scan, &files, &empty_folder_sizes)
                 .ok_or_else(|| "Indexing failed".to_string())?;
-        Ok::<_, String>((result, files))
+        Ok::<_, String>((result, files, folder_paths))
     })
     .await
     {
-        Ok(Ok(pair)) => pair,
+        Ok(Ok(triple)) => triple,
         Ok(Err(e)) => {
-            write_debug_log(&state, &format!("error scan_directory: {}", e));
+            write_debug_log(&state, &format!("error scan_directory phase1: {}", e));
             return Err(e);
         }
         Err(e) => {
-            write_debug_log(&state, &format!("error scan_directory spawn: {}", e));
+            write_debug_log(&state, &format!("error scan_directory phase1 spawn: {}", e));
             return Err(e.to_string());
         }
     };
+    write_debug_log(&state, &format!(
+        "scan_directory phase1_done path={} files={} folders={} ms={}",
+        path, files.len(), folder_paths.len(), scan_start.elapsed().as_millis(),
+    ));
 
-    // Phase 1b: build active in-memory indexes for this root from the scan results.
-    {
-        // Build DiskObjects for files only at this stage.
-        let mut disk_objs: Vec<DiskObject> = files
-            .iter()
-            .map(|f| {
-                let path_string = f.path.to_string_lossy().to_string();
-                let path_lower = path_string.to_ascii_lowercase();
-                let parent = cutest_disk_tree::parent_dir(&path_string);
-                let name = std::path::Path::new(&path_string)
-                    .file_name()
-                    .and_then(|os| os.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| path_string.clone());
-                let name_lower = name.to_ascii_lowercase();
-                let ext = std::path::Path::new(&path_string)
-                    .extension()
-                    .and_then(|os| os.to_str())
-                    .map(|s| s.to_ascii_lowercase());
-                DiskObject {
-                    root: path.clone(),
-                    path: path_string.clone(),
-                    path_lower,
-                    parent_path: if parent.is_empty() { None } else { Some(parent) },
-                    name: name.clone(),
-                    name_lower,
-                    ext,
-                    kind: DiskObjectKind::File,
-                    size: Some(f.size),
-                    recursive_size: None,
-                    dev: Some(f.file_key.dev),
-                    ino: Some(f.file_key.ino),
-                    mtime: f.mtime,
-                }
-            })
-            .collect();
-        // Keep disk_objects lexicographically sorted by path.
-        disk_objs.sort_by(|a, b| a.path.cmp(&b.path));
-        let name_index = build_name_reverse_index(&disk_objs);
+    // Phase 1b: build DiskObjects + suffix index so find_files works immediately.
+    activate_initial_index(&app, &state, &path, &files, &folder_paths);
 
-        let mut disk_map = state.disk_objects.lock().unwrap();
-        disk_map.insert(path.clone(), Arc::new(disk_objs));
-        let mut rev_map = state.name_reverse_index.lock().unwrap();
-        rev_map.insert(path.clone(), Arc::new(name_index));
-    }
-
-    // Phase 2: in the background, compute recursive folder sizes, write everything to SQLite,
-    // and then swap the updated folder index into active memory.
-    {
-        let db_path_bg = db_path.clone();
-        let path_for_db_bg = path_for_db.clone();
-        let root_bg = path_buf.clone();
-        let files_bg = files.clone();
-        let app_bg = app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            use std::time::Instant;
-
-            let total_start = Instant::now();
-            let folder_sizes_start = Instant::now();
-            let folder_sizes = cutest_disk_tree::compute_folder_sizes(&root_bg, &files_bg);
-            let folder_sizes_ms = folder_sizes_start.elapsed().as_millis();
-
-            // Update in-memory disk objects and name reverse index for this root to include folders.
-            let in_memory_start = Instant::now();
-            let state_ptr: tauri::State<AppState> = app_bg.state();
-            write_debug_log(
-                &state_ptr,
-                &format!(
-                    "scan_directory phase2 backfill start root={} files={} folder_entries={} compute_folder_sizes_ms={}",
-                    path_for_db_bg,
-                    files_bg.len(),
-                    folder_sizes.len(),
-                    folder_sizes_ms,
-                ),
-            );
-
-            // Build a new DiskObject Vec and NameReverseIndex off to the side,
-            // then swap Arc pointers into AppState to minimize lock contention.
-            let existing_arc_opt = {
-                let disk_map = state_ptr.disk_objects.lock().unwrap();
-                disk_map.get(&path_for_db_bg).cloned()
-            };
-
-            if let Some(existing_arc) = existing_arc_opt {
-                let mut new_objs: Vec<DiskObject> = (*existing_arc).clone();
-
-                for (p, s) in &folder_sizes {
-                    let path_string = p.to_string_lossy().to_string();
-                    if new_objs.iter().any(|o| o.path == path_string) {
-                        continue;
-                    }
-                    let path_lower = path_string.to_ascii_lowercase();
-                    let parent = cutest_disk_tree::parent_dir(&path_string);
-                    let name = std::path::Path::new(&path_string)
-                        .file_name()
-                        .and_then(|os| os.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| path_string.clone());
-                    let name_lower = name.to_ascii_lowercase();
-                    new_objs.push(DiskObject {
-                        root: path_for_db_bg.clone(),
-                        path: path_string.clone(),
-                        path_lower,
-                        parent_path: if parent.is_empty() { None } else { Some(parent) },
-                        name,
-                        name_lower,
-                        ext: None,
-                        kind: DiskObjectKind::Folder,
-                        size: None,
-                        recursive_size: Some(*s),
-                        dev: None,
-                        ino: None,
-                        mtime: None,
-                    });
-                }
-                new_objs.sort_by(|a, b| a.path.cmp(&b.path));
-
-                let name_index = build_name_reverse_index(&new_objs);
-
-                let new_objs_arc = Arc::new(new_objs);
-                let name_index_arc = Arc::new(name_index);
-
-                {
-                    let mut disk_map = state_ptr.disk_objects.lock().unwrap();
-                    disk_map.insert(path_for_db_bg.clone(), new_objs_arc);
-                    let mut rev_map = state_ptr.name_reverse_index.lock().unwrap();
-                    rev_map.insert(path_for_db_bg.clone(), name_index_arc);
-                }
-            }
-            let in_memory_ms = in_memory_start.elapsed().as_millis();
-
-            // Persist to SQLite in the background.
-            let db_open_start = Instant::now();
-            let conn = match db::open_db(&db_path_bg) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("background db open failed: {}", e);
-                    write_debug_log(
-                        &state_ptr,
-                        &format!(
-                            "scan_directory phase2 db_open_failed root={} error={} total_ms={}",
-                            path_for_db_bg,
-                            e,
-                            total_start.elapsed().as_millis(),
-                        ),
-                    );
-                    return;
-                }
-            };
-            let db_open_ms = db_open_start.elapsed().as_millis();
-
-            let db_write_start = Instant::now();
-            let write_result = db::write_scan(&conn, &path_for_db_bg, &files_bg, &folder_sizes);
-            let db_write_ms = db_write_start.elapsed().as_millis();
-            let total_ms = total_start.elapsed().as_millis();
-
-            match write_result {
-                Ok(()) => {
-                    write_debug_log(
-                        &state_ptr,
-                        &format!(
-                            "scan_directory phase2 done root={} files={} folder_entries={} compute_folder_sizes_ms={} in_memory_ms={} db_open_ms={} db_write_ms={} total_ms={}",
-                            path_for_db_bg,
-                            files_bg.len(),
-                            folder_sizes.len(),
-                            folder_sizes_ms,
-                            in_memory_ms,
-                            db_open_ms,
-                            db_write_ms,
-                            total_ms,
-                        ),
-                    );
-                }
-                Err(e) => {
-                    eprintln!("background write_scan failed: {}", e);
-                    write_debug_log(
-                        &state_ptr,
-                        &format!(
-                            "scan_directory phase2 db_write_failed root={} error={} compute_folder_sizes_ms={} in_memory_ms={} db_open_ms={} db_write_ms={} total_ms={}",
-                            path_for_db_bg,
-                            e,
-                            folder_sizes_ms,
-                            in_memory_ms,
-                            db_open_ms,
-                            db_write_ms,
-                            total_ms,
-                        ),
-                    );
-                }
-            }
-        });
-    }
+    // Phase 2: background — compute folder sizes, update index, persist to SQLite.
+    // Cancel any still-running phase 2 before spawning a new one.
+    let cancel_token = {
+        let mut guard = state.phase2_cancel.lock().unwrap();
+        guard.store(true, Ordering::Relaxed);
+        let fresh = Arc::new(AtomicBool::new(false));
+        *guard = fresh.clone();
+        fresh
+    };
+    let app_bg = app.clone();
+    let files_bg = files.clone();
+    let root_str_bg = path.clone();
+    let root_buf_bg = path_buf.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_phase2(app_bg, db_path, root_str_bg, root_buf_bg, files_bg, cancel_token);
+    });
 
     write_debug_log(&state, &format!("scan_directory done path={}", path));
     Ok(result)
 }
 
 #[cfg(test)]
-mod tests {
+mod search_tests {
     use super::*;
 
     #[test]
@@ -636,48 +747,99 @@ mod tests {
         assert!(folder_entry.file_key.is_none());
     }
 
+    fn make_file(root: &str, name: &str, ino: u64) -> DiskObject {
+        DiskObject {
+            root: root.to_string(),
+            path: format!("{}/{}", root, name),
+            path_lower: format!("{}/{}", root, name.to_ascii_lowercase()),
+            parent_path: Some(root.to_string()),
+            name: name.to_string(),
+            name_lower: name.to_ascii_lowercase(),
+            ext: name.rsplit('.').next().map(|e| e.to_ascii_lowercase()),
+            kind: DiskObjectKind::File,
+            size: Some(0),
+            recursive_size: None,
+            dev: Some(1),
+            ino: Some(ino),
+            mtime: None,
+        }
+    }
+
     #[test]
-    fn build_name_reverse_index_uses_diskobject_name() {
+    fn suffix_index_finds_both_names_containing_query() {
         let objs = vec![
-            DiskObject {
-                root: "C:/root".to_string(),
-                path: "C:/root/AbstractButton.qml".to_string(),
-                path_lower: "c:/root/abstractbutton.qml".to_string(),
-                parent_path: Some("C:/root".to_string()),
-                name: "AbstractButton.qml".to_string(),
-                name_lower: "abstractbutton.qml".to_string(),
-                ext: Some("qml".to_string()),
-                kind: DiskObjectKind::File,
-                size: Some(0),
-                recursive_size: None,
-                dev: Some(1),
-                ino: Some(1),
-                mtime: None,
-            },
-            DiskObject {
-                root: "C:/root".to_string(),
-                path: "C:/root/Button.txt".to_string(),
-                path_lower: "c:/root/button.txt".to_string(),
-                parent_path: Some("C:/root".to_string()),
-                name: "Button.txt".to_string(),
-                name_lower: "button.txt".to_string(),
-                ext: Some("txt".to_string()),
-                kind: DiskObjectKind::File,
-                size: Some(0),
-                recursive_size: None,
-                dev: Some(1),
-                ino: Some(2),
-                mtime: None,
-            },
+            make_file("C:/root", "AbstractButton.qml", 1),
+            make_file("C:/root", "Button.txt", 2),
         ];
 
-        let index = build_name_reverse_index(&objs);
-        let candidates = candidate_indices_from_reverse_index(&index, "button")
+        let (index, ..) = build_suffix_index(&objs);
+        let candidates = search_suffix_index(&index, "button")
             .expect("should return some candidates");
 
-        // Both names contain "button" (case-insensitive) so both should be candidates.
         assert!(candidates.contains(&0));
         assert!(candidates.contains(&1));
+    }
+
+    #[test]
+    fn suffix_index_returns_empty_set_for_no_match() {
+        let objs = vec![
+            make_file("C:/root", "readme.md", 1),
+            make_file("C:/root", "main.rs", 2),
+        ];
+
+        let (index, ..) = build_suffix_index(&objs);
+        let candidates = search_suffix_index(&index, "zzznomatch")
+            .expect("should return Some (empty set)");
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn suffix_index_no_bleed_across_name_boundary() {
+        // "file" ends in 'e', "exe" starts with 'e' — "lee" must NOT match across the boundary.
+        let objs = vec![
+            make_file("C:/root", "file.txt", 1),
+            make_file("C:/root", "exe.bin", 2),
+        ];
+
+        let (index, ..) = build_suffix_index(&objs);
+        // "lee" would only exist if "file\0exe" were treated as one string ("filee" wouldn't match "lee").
+        // The null separator prevents cross-name matches.
+        let candidates = search_suffix_index(&index, "lee");
+        // Either None (empty index path) or Some(empty) — definitely not matching either file.
+        if let Some(c) = candidates {
+            assert!(c.is_empty());
+        }
+    }
+
+    #[test]
+    fn suffix_index_skips_folders() {
+        let mut objs = vec![
+            make_file("C:/root", "notes.txt", 1),
+        ];
+        objs.push(DiskObject {
+            root: "C:/root".to_string(),
+            path: "C:/root/notes_folder".to_string(),
+            path_lower: "c:/root/notes_folder".to_string(),
+            parent_path: Some("C:/root".to_string()),
+            name: "notes_folder".to_string(),
+            name_lower: "notes_folder".to_string(),
+            ext: None,
+            kind: DiskObjectKind::Folder,
+            size: None,
+            recursive_size: Some(0),
+            dev: None,
+            ino: None,
+            mtime: None,
+        });
+
+        let (index, ..) = build_suffix_index(&objs);
+        let candidates = search_suffix_index(&index, "notes")
+            .expect("should match the file");
+
+        // Only the file (index 0) should appear; the folder (index 1) is not indexed.
+        assert!(candidates.contains(&0));
+        assert!(!candidates.contains(&1));
     }
 
 }
@@ -1085,12 +1247,20 @@ fn find_files(
     let q = q_trimmed.to_lowercase();
     let q_len = q_trimmed.chars().count();
 
+    let suffix_search_start = Instant::now();
     let candidate_set_opt = {
         let guard = state.name_reverse_index.lock().unwrap();
         guard
             .get(&root)
-            .and_then(|idx| candidate_indices_from_reverse_index(idx.as_ref(), &q))
+            .and_then(|idx| search_suffix_index(idx.as_ref(), &q))
     };
+    let suffix_search_ms = suffix_search_start.elapsed().as_millis();
+    write_debug_log(&state, &format!(
+        "find_files suffix_search q_len={} candidates={} ms={}",
+        q_len,
+        candidate_set_opt.as_ref().map(|s| s.len()).unwrap_or(0),
+        suffix_search_ms,
+    ));
 
     if !use_fuzzy || q_len < 3 {
         let build_start = Instant::now();
@@ -1235,15 +1405,20 @@ pub fn run() {
 
             // Preload active memory from SQLite if prior indexes exist.
             let mut disk_objects_map: HashMap<String, Arc<Vec<DiskObject>>> = HashMap::new();
-            let mut name_reverse_index_map: HashMap<String, Arc<NameReverseIndex>> = HashMap::new();
+            let mut name_reverse_index_map: HashMap<String, Arc<SuffixIndex>> = HashMap::new();
 
             let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
             let roots = db::list_roots(&conn).map_err(|e| e.to_string())?;
             for root in roots {
                 let mut objs = db::get_disk_objects_for_root(&conn, &root).unwrap_or_default();
-                // Ensure deterministic lexicographic order in memory.
                 objs.sort_by(|a, b| a.path.cmp(&b.path));
-                let name_index = build_name_reverse_index(&objs);
+                let t_suffix = Instant::now();
+                let (name_index, concat_ms, table_ms) = build_suffix_index(&objs);
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "startup build_suffix_index root={} objects={} concat_ms={} table_ms={} total_ms={}",
+                    root, objs.len(), concat_ms, table_ms, t_suffix.elapsed().as_millis(),
+                );
                 disk_objects_map.insert(root.clone(), Arc::new(objs));
                 name_reverse_index_map.insert(root.clone(), Arc::new(name_index));
             }
@@ -1253,6 +1428,7 @@ pub fn run() {
                 debug_log: Mutex::new(Some(debug_log_path)),
                 disk_objects: Mutex::new(disk_objects_map),
                 name_reverse_index: Mutex::new(name_reverse_index_map),
+                phase2_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             });
             Ok(())
         })

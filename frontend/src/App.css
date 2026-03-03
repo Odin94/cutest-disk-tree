@@ -64,6 +64,32 @@ body {
   color: #a1a1aa;
 }
 
+.scan-phase-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: #a1a1aa;
+}
+
+.scan-phase-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid #4b5563;
+  border-top-color: #e5e7eb;
+  animation: scan-phase-spin 0.7s linear infinite;
+}
+
+@keyframes scan-phase-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .secondary {
   padding: 0.5rem 1rem;
   font-size: 0.875rem;

@@ -527,6 +527,7 @@ dependencies = [
 name = "cutest-disk-tree"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ignore",
  "jwalk",
  "nucleo",
@@ -535,6 +536,7 @@ dependencies = [
  "rusqlite_migration",
  "serde",
  "serde_json",
+ "suffix",
  "usn-journal-rs",
  "walkdir",
  "win-file-id",

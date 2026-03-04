@@ -65,49 +65,6 @@ fn make_file(name: &str, ino: u64) -> DiskObject {
 }
 
 #[test]
-fn suffix_index_finds_both_names_containing_query() {
-    let objs = vec![
-        make_file("AbstractButton.qml", 1),
-        make_file("Button.txt", 2),
-    ];
-
-    let (index, ..) = build_suffix_index(&objs);
-    let candidates = search_suffix_index(&index, "button")
-        .expect("should return some candidates");
-
-    assert!(candidates.contains(&0));
-    assert!(candidates.contains(&1));
-}
-
-#[test]
-fn suffix_index_returns_empty_set_for_no_match() {
-    let objs = vec![
-        make_file("readme.md", 1),
-        make_file("main.rs", 2),
-    ];
-
-    let (index, ..) = build_suffix_index(&objs);
-    let candidates = search_suffix_index(&index, "zzznomatch")
-        .expect("should return Some (empty set)");
-
-    assert!(candidates.is_empty());
-}
-
-#[test]
-fn suffix_index_no_bleed_across_name_boundary() {
-    let objs = vec![
-        make_file("file.txt", 1),
-        make_file("exe.bin", 2),
-    ];
-
-    let (index, ..) = build_suffix_index(&objs);
-    let candidates = search_suffix_index(&index, "lee");
-    if let Some(c) = candidates {
-        assert!(c.is_empty());
-    }
-}
-
-#[test]
 fn suffix_index_skips_folders() {
     let mut objs = vec![
         make_file("notes.txt", 1),
@@ -133,14 +90,6 @@ fn suffix_index_skips_folders() {
 
     assert!(candidates.contains(&0));
     assert!(!candidates.contains(&1));
-}
-
-#[test]
-fn suffix_index_empty_objects_returns_none() {
-    let objs: Vec<DiskObject> = Vec::new();
-    let (index, ..) = build_suffix_index(&objs);
-    let result = search_suffix_index(&index, "anything");
-    assert!(result.is_none());
 }
 
 #[test]

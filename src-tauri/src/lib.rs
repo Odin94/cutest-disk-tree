@@ -1,4 +1,5 @@
 use cutest_disk_tree::{db, DiskObject, DiskObjectKind};
+use cutest_disk_tree::core::indexing::suffix::{SuffixIndex, build_suffix_index, search_suffix_index};
 use std::collections::{HashMap, HashSet};
 use suffix::SuffixTable;
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,6 @@ use tauri::Emitter;
 use nucleo::{Matcher, Config};
 use nucleo::pattern::{Pattern, CaseMatching, Normalization};
 use serde::Serialize;
-use chrono::Utc;
 use std::io::Write;
 use sysinfo::{Pid, System};
 
@@ -120,57 +120,9 @@ struct AppState {
     scan_path_override: Option<String>,
 }
 
-struct SuffixIndex {
-    st: SuffixTable<'static, 'static>,
-    offsets: Vec<usize>,
-    disk_object_indices: Vec<usize>,
-    buffer: String,
-}
-
-fn build_suffix_index(objects: &[DiskObject]) -> (SuffixIndex, u128, u128) {
-    let concat_start = Instant::now();
-    let mut buffer = String::with_capacity(objects.len() * 16);
-    let mut offsets: Vec<usize> = Vec::with_capacity(objects.len());
-    let mut disk_object_indices: Vec<usize> = Vec::with_capacity(objects.len());
-
-    for (i, o) in objects.iter().enumerate() {
-        offsets.push(buffer.len());
-        disk_object_indices.push(i);
-        buffer.push_str(&o.name_lower);
-        buffer.push('\0');
-    }
-    let concat_ms = concat_start.elapsed().as_millis();
-
-    let table_start = Instant::now();
-    let st = SuffixTable::new(buffer.clone());
-    let table_ms = table_start.elapsed().as_millis();
-
-    (SuffixIndex { st, offsets, disk_object_indices, buffer }, concat_ms, table_ms)
-}
-
-fn search_suffix_index(index: &SuffixIndex, q_lower: &str) -> Option<HashSet<usize>> {
-    if q_lower.is_empty() || index.offsets.is_empty() {
-        return None;
-    }
-
-    let positions = index.st.positions(q_lower);
-
-    if positions.is_empty() {
-        return Some(HashSet::new());
-    }
-
-    let mut result: HashSet<usize> = HashSet::new();
-    for &pos in positions {
-        let pos = pos as usize;
-        let local_idx = index.offsets.partition_point(|&x| x <= pos) - 1;
-        result.insert(index.disk_object_indices[local_idx]);
-    }
-    Some(result)
-}
-
-fn write_debug_log(state: &AppState, message: &str) {
+fn resolve_debug_log_path(state: &AppState) -> std::path::PathBuf {
     let mut guard = state.debug_log.lock().unwrap();
-    let path = guard
+    guard
         .get_or_insert_with(|| {
             state
                 .db_path
@@ -178,15 +130,12 @@ fn write_debug_log(state: &AppState, message: &str) {
                 .map(|p| p.join("debug.log"))
                 .unwrap_or_else(|| std::path::PathBuf::from("debug.log"))
         })
-        .clone();
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{} {}", Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"), message);
-        let _ = f.flush();
-    }
+        .clone()
+}
+
+fn write_debug_log(state: &AppState, message: &str) {
+    let path = resolve_debug_log_path(state);
+    cutest_disk_tree::logging::debug_log::write_debug_log(&path, message);
 }
 
 #[tauri::command]
@@ -197,18 +146,19 @@ fn debug_log(state: tauri::State<AppState>, message: String) -> Result<(), Strin
 
 #[tauri::command]
 fn get_debug_log_path(state: tauri::State<AppState>) -> Result<String, String> {
-    let guard = state.debug_log.lock().unwrap();
-    let path = guard
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| {
-            state
-                .db_path
-                .parent()
-                .map(|p| p.join("debug.log"))
-                .unwrap_or_else(|| std::path::PathBuf::from("debug.log"))
-        });
+    let path = resolve_debug_log_path(&state);
     Ok(path.display().to_string())
+}
+
+#[tauri::command]
+fn debug_log_stats(state: tauri::State<AppState>, message: String) -> Result<(), String> {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        log_memory_and_message(&state, &message);
+    }));
+    if res.is_err() {
+        write_debug_log(&state, &format!("memory_mb=panic {}", message));
+    }
+    Ok(())
 }
 
 fn log_memory_and_message(state: &AppState, message: &str) {
@@ -225,17 +175,6 @@ fn log_memory_and_message(state: &AppState, message: &str) {
     })();
     let line = format!("memory_mb={} {}", mem_mb, message);
     write_debug_log(state, &line);
-}
-
-#[tauri::command]
-fn debug_log_stats(state: tauri::State<AppState>, message: String) -> Result<(), String> {
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        log_memory_and_message(&state, &message);
-    }));
-    if res.is_err() {
-        write_debug_log(&state, &format!("memory_mb=panic {}", message));
-    }
-    Ok(())
 }
 
 fn make_disk_object_from_path(
@@ -581,28 +520,13 @@ async fn scan_directory(
     let scan_start = Instant::now();
     let roots_for_scan = scan_roots.clone();
     let (files_arc, all_folder_paths, roots_str) = match tauri::async_runtime::spawn_blocking(move || {
-        let mut all_files: Vec<cutest_disk_tree::FileEntry> = Vec::new();
-        let mut all_folders: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
-        let mut cumulative_offset: u64 = 0;
-
-        for root in &roots_for_scan {
-            let offset = cumulative_offset;
-            let app_ref = app_for_scan.clone();
-            let (files, folder_paths) =
-                cutest_disk_tree::index_directory_ignore_with_progress(root, move |p| {
-                    let _ = app_ref.emit("scan-progress", &cutest_disk_tree::ScanProgress {
-                        files_count: p.files_count + offset,
-                        current_path: p.current_path,
-                        status: p.status,
-                    });
-                });
-            cumulative_offset += files.len() as u64;
-            all_files.extend(files);
-            all_folders.extend(folder_paths);
-        }
-
-        let roots_str: Vec<String> = roots_for_scan.iter().map(|r| r.to_string_lossy().to_string()).collect();
-        let files_arc = Arc::new(all_files);
+        let (files_arc, all_folders, roots_str) =
+            cutest_disk_tree::core::scanning::ignore_scanner::scan_roots_with_ignore(
+                &roots_for_scan,
+                move |p| {
+                    let _ = app_for_scan.emit("scan-progress", &p);
+                },
+            );
         Ok::<_, String>((files_arc, all_folders, roots_str))
     })
     .await
@@ -1164,18 +1088,27 @@ fn find_files(
 }
 
 fn load_dotenv_from_repo() {
-    let mut dir = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(_) => return,
-    };
-    loop {
-        dir.pop();
-        let env_path = dir.join(".env");
+    use std::path::PathBuf;
+
+    // 1. Try the workspace root (parent of the src-tauri crate)
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(parent) = manifest_dir.parent() {
+        candidates.push(parent.join(".env"));
+    }
+
+    // 2. Try the src-tauri crate directory itself
+    candidates.push(manifest_dir.join(".env"));
+
+    // 3. Try the current working directory (useful in dev)
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(".env"));
+    }
+
+    for env_path in candidates {
         if env_path.is_file() {
-            let _ = dotenvy::from_path(env_path);
-            break;
-        }
-        if !dir.pop() {
+            let _ = dotenvy::from_path(&env_path);
             break;
         }
     }
@@ -1185,6 +1118,7 @@ fn load_dotenv_from_repo() {
 pub fn run() {
     load_dotenv_from_repo();
 
+    // TODOdin: Remember that we set this in .env!
     let scan_path_override = std::env::var("CUTE_DISK_TREE_SCAN_PATH").ok();
 
     tauri::Builder::default()
@@ -1210,6 +1144,23 @@ pub fn run() {
                 .and_then(|mut f| {
                     use std::io::Write;
                     f.write_all(b"=== starting cutest disk tree ===\n\n")?;
+                    f.flush()
+                });
+
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&debug_log_path)
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, "Loaded config from environment:")?;
+                    if let Ok(path) = std::env::var("CUTE_DISK_TREE_DEBUG_LOG_PATH") {
+                        writeln!(f, "CUTE_DISK_TREE_DEBUG_LOG_PATH={}", path)?;
+                    }
+                    if let Ok(path) = std::env::var("CUTE_DISK_TREE_SCAN_PATH") {
+                        writeln!(f, "CUTE_DISK_TREE_SCAN_PATH={}", path)?;
+                    }
+                    writeln!(f)?;
                     f.flush()
                 });
 

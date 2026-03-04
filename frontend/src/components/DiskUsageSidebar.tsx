@@ -102,8 +102,9 @@ export const DiskUsageSidebar = ({
     );
   }
 
-  const rootSize = scan.folder_sizes[scan.root] ?? 0;
-  const displayPath = hoveredPath ?? scan.root;
+  const primaryRoot = scan.roots.length > 0 ? scan.roots[0] : "";
+  const rootSize = primaryRoot.length > 0 ? (scan.folder_sizes[primaryRoot] ?? 0) : 0;
+  const displayPath = hoveredPath ?? primaryRoot;
   const displayName = basename(displayPath);
   const displaySize = scan.folder_sizes[displayPath] ?? rootSize;
 
@@ -147,7 +148,7 @@ export const DiskUsageSidebar = ({
         </span>
         <span className="disk-usage-sidebar-size">{humanSize(displaySize)}</span>
       </div>
-      {displayPath !== scan.root ? (
+      {displayPath !== primaryRoot ? (
         <p className="disk-usage-sidebar-path" title={displayPath}>
           {displayPath}
         </p>

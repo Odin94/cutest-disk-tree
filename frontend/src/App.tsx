@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
-import { scanDirectory, pickDirectory, onScanProgress, loadCachedScan, debugLog, onScanPhaseStatus, onScanFolderSizesReady } from "./api";
-import type { ScanResult, ScanProgress, FolderSizesReady } from "./types";
+import { scanDirectory, onScanProgress, loadCachedScan, debugLog, onScanPhaseStatus, onScanFolderSizesReady } from "./api";
+import type { ScanResult, ScanProgress, FolderSizesReady, ScanDirectoryResponse } from "./types";
 import "./App.css";
 import { DiskUsageView } from "./views/DiskUsageView";
 import { FileFindingView } from "./views/FileFindingView";
@@ -52,39 +52,37 @@ const CheckForUpdatesButton = () => {
 };
 
 const App = () => {
-  const [category, setCategory] = useState<CategoryId>("disk");
+  const [category, setCategory] = useState<CategoryId>("find");
   const [result, setResult] = useState<ScanResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
-  const [scanRootPath, setScanRootPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scanPhaseStatus, setScanPhaseStatus] = useState<string>("");
   const unlistenRef = useRef<(() => void) | null>(null);
   const phaseStatusUnlistenRef = useRef<(() => void) | null>(null);
   const scanCancelRef = useRef(false);
+  const scanInProgressRef = useRef(false);
   const progressLogTimeRef = useRef(0);
   const PROGRESS_LOG_INTERVAL_MS = 2000;
-  // Holds the most recently received folder-sizes event payload. Phase 2 can
-  // emit this before scanDirectory's invoke promise resolves, so we stash it
-  // here and apply it right after setResult(data) to avoid the race.
   const latestFolderSizesRef = useRef<FolderSizesReady | null>(null);
 
   const runScan = async () => {
-    debugLog("App runScan pickDirectory opened");
-    const path = await pickDirectory();
-    if (path === null) {
-      debugLog("App runScan cancelled (no path)");
+    if (scanInProgressRef.current) {
+      const stack = new Error().stack ?? "(no stack)";
+      debugLog(`App runScan BLOCKED (already in progress) stack=${stack.split("\n").slice(0, 5).join(" | ")}`);
+      console.error("[runScan] BLOCKED - scan already in progress", stack);
       return;
     }
-    debugLog(`App runScan initiated path=${path}`);
+    scanInProgressRef.current = true;
+    debugLog("App runScan initiated");
     latestFolderSizesRef.current = null;
-    setScanRootPath(path);
     setLoading(true);
     setProgress(null);
     setError(null);
     scanCancelRef.current = false;
     progressLogTimeRef.current = 0;
     try {
+      debugLog("App runScan: setting up progress listener");
       unlistenRef.current = await onScanProgress((p) => {
         setProgress(p);
         const now = Date.now();
@@ -94,22 +92,26 @@ const App = () => {
           debugLog(`App scan progress files=${p.files_count} current_path=${top.slice(-60)}`);
         }
       });
-      const data = await scanDirectory(path);
+      debugLog("App runScan: calling scanDirectory");
+      const summary: ScanDirectoryResponse = await scanDirectory();
+      debugLog(`App runScan: scanDirectory returned files_count=${summary.files_count} folders_count=${summary.folders_count}`);
       if (scanCancelRef.current) {
         debugLog("App runScan completed but was cancelled, ignoring result");
         return;
       }
-      debugLog(`App runScan done path=${path} files=${data.files.length}`);
-      setResult(data);
-      // If the folder-sizes event already arrived before this point, apply it
-      // now on top of the just-set result (React batches these two updates).
+      const scanResult: ScanResult = {
+        roots: summary.roots,
+        files: [],
+        folder_sizes: {},
+        files_count: summary.files_count,
+        folders_count: summary.folders_count,
+      };
       const latestSizes = latestFolderSizesRef.current as FolderSizesReady | null;
-      if (latestSizes !== null && latestSizes.root === path) {
-        const folderSizes = latestSizes.folder_sizes;
-        setResult((prev) =>
-          prev !== null ? { ...prev, folder_sizes: folderSizes } : prev
-        );
+      if (latestSizes !== null) {
+        scanResult.folder_sizes = latestSizes.folder_sizes;
       }
+      debugLog(`App runScan done files_count=${summary.files_count}`);
+      setResult(scanResult);
       if (category !== "find") setCategory("find");
     } catch (e) {
       if (!scanCancelRef.current) {
@@ -121,22 +123,23 @@ const App = () => {
         unlistenRef.current();
         unlistenRef.current = null;
       }
+      scanInProgressRef.current = false;
       setLoading(false);
       setProgress(null);
-      setScanRootPath(null);
+      debugLog("App runScan finally: cleanup done, scanInProgressRef=false");
     }
   };
 
   const cancelScan = () => {
     debugLog("App cancelScan");
     scanCancelRef.current = true;
+    scanInProgressRef.current = false;
     if (unlistenRef.current) {
       unlistenRef.current();
       unlistenRef.current = null;
     }
     setLoading(false);
     setProgress(null);
-    setScanRootPath(null);
   };
 
   useEffect(() => {
@@ -165,11 +168,9 @@ const App = () => {
     let unlisten: (() => void) | null = null;
     onScanFolderSizesReady((payload) => {
       if (!isMounted) return;
-      // Always stash the payload so runScan can pick it up even if it arrives
-      // before setResult(data) runs.
       latestFolderSizesRef.current = payload;
       setResult((prev) =>
-        prev !== null && prev.root === payload.root
+        prev !== null
           ? { ...prev, folder_sizes: payload.folder_sizes }
           : prev
       );
@@ -186,17 +187,25 @@ const App = () => {
     };
   }, []);
 
-  const handleSelectCachedRoot = async (root: string) => {
-    debugLog(`App handleSelectCachedRoot root=${root}`);
-    try {
-      const scan = await loadCachedScan(root);
-      if (scan != null) setResult(scan);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError("Failed to load cached scan.");
-      debugLog(`App handleSelectCachedRoot error: ${msg}`);
-    }
-  };
+  useEffect(() => {
+    debugLog("App mount: loading cached scan");
+    loadCachedScan().then((summary) => {
+      if (summary != null) {
+        debugLog(`App cached scan loaded files_count=${summary.files_count} folders_count=${summary.folders_count}`);
+        setResult({
+          roots: summary.roots,
+          files: [],
+          folder_sizes: summary.folder_sizes,
+          files_count: summary.files_count,
+          folders_count: summary.folders_count,
+        });
+      } else {
+        debugLog("App no cached scan found");
+      }
+    }).catch((e) => {
+      debugLog(`App loadCachedScan error: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }, []);
 
   return (
     <div
@@ -243,7 +252,12 @@ const App = () => {
           className="view view-disk-usage"
           style={{ display: category === "disk" ? "block" : "none" }}
         >
-          <DiskUsageView externalScanRoot={result ? result.root : null} />
+          <DiskUsageView
+            result={result}
+            onScan={runScan}
+            scanning={loading}
+            scanProgress={progress}
+          />
         </div>
         <div
           className="view view-file-finding"
@@ -254,10 +268,8 @@ const App = () => {
             loading={loading}
             error={error}
             progress={progress}
-            scanRootPath={scanRootPath}
             onScan={runScan}
             onCancelScan={cancelScan}
-            onSelectCachedRoot={handleSelectCachedRoot}
           />
         </div>
       </div>

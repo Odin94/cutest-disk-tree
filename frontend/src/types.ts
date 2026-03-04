@@ -16,13 +16,20 @@ export type ScanProgress = {
 };
 
 export type ScanResult = {
-  root: string;
+  roots: string[];
   files: FileEntry[];
   folder_sizes: Record<string, number>;
+  files_count?: number;
+  folders_count?: number;
+};
+
+export type ScanDirectoryResponse = {
+  roots: string[];
+  files_count: number;
+  folders_count: number;
 };
 
 export type FolderSizesReady = {
-  root: string;
   folder_sizes: Record<string, number>;
 };
 

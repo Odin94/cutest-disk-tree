@@ -1,0 +1,140 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { getFileName, FileFindingView } from "../views/FileFindingView";
+import type { ScanResult, ScanProgress } from "../types";
+
+vi.mock("../api", () => ({
+  debugLog: vi.fn(),
+  findFiles: vi.fn(() =>
+    Promise.resolve({ items: [], nextOffset: null })
+  ),
+}));
+
+const makeScan = (): ScanResult => ({
+  roots: ["C:\\data"],
+  files: [
+    { path: "C:\\data\\a.txt", size: 100, file_key: { dev: 1, ino: 1 } },
+    { path: "C:\\data\\b.txt", size: 200, file_key: { dev: 1, ino: 2 } },
+  ],
+  folder_sizes: {
+    "C:\\data": 300,
+  },
+});
+
+describe("getFileName", () => {
+  it("extracts name from unix path", () => {
+    expect(getFileName("/home/user/file.txt")).toBe("file.txt");
+  });
+
+  it("extracts name from windows path", () => {
+    expect(getFileName("C:\\Users\\test\\file.txt")).toBe("file.txt");
+  });
+
+  it("returns input for plain name", () => {
+    expect(getFileName("file.txt")).toBe("file.txt");
+  });
+
+  it("handles empty string", () => {
+    expect(getFileName("")).toBe("");
+  });
+});
+
+describe("FileFindingView", () => {
+  const defaultProps = {
+    result: null as ScanResult | null,
+    loading: false,
+    error: null as string | null,
+    progress: null as ScanProgress | null,
+    onScan: vi.fn(),
+    onCancelScan: vi.fn(),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("renders empty state when no result", () => {
+    render(<FileFindingView {...defaultProps} />);
+    expect(
+      screen.getByText(/Click.*Scan filesystem.*to start/i)
+    ).toBeInTheDocument();
+  });
+
+  it("renders scan button", () => {
+    render(<FileFindingView {...defaultProps} />);
+    const btn = screen.getByRole("button", { name: /scan filesystem/i });
+    expect(btn).toBeInTheDocument();
+    expect(btn).not.toBeDisabled();
+  });
+
+  it("disables scan button when loading", () => {
+    render(<FileFindingView {...defaultProps} loading={true} />);
+    const btn = screen.getByRole("button", { name: /scanning/i });
+    expect(btn).toBeDisabled();
+  });
+
+  it("shows error message", () => {
+    render(
+      <FileFindingView {...defaultProps} error="something went wrong" />
+    );
+    expect(screen.getByText("something went wrong")).toBeInTheDocument();
+  });
+
+  it("shows progress panel when loading with progress", () => {
+    const progress: ScanProgress = { files_count: 12345 };
+    render(
+      <FileFindingView {...defaultProps} loading={true} progress={progress} />
+    );
+    const matches = screen.getAllByText(/12[.,]345 files scanned/);
+    expect(matches.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("shows cancel button when loading and onCancelScan provided", () => {
+    render(
+      <FileFindingView
+        {...defaultProps}
+        loading={true}
+        progress={{ files_count: 100 }}
+      />
+    );
+    const cancelBtn = screen.getByRole("button", { name: /cancel scan/i });
+    expect(cancelBtn).toBeInTheDocument();
+  });
+
+  it("calls onScan when scan button is clicked", async () => {
+    const user = userEvent.setup();
+    render(<FileFindingView {...defaultProps} />);
+    const btn = screen.getByRole("button", { name: /scan filesystem/i });
+    await user.click(btn);
+    expect(defaultProps.onScan).toHaveBeenCalledOnce();
+  });
+
+  it("renders summary with scanned roots when result is provided", () => {
+    render(<FileFindingView {...defaultProps} result={makeScan()} />);
+    expect(screen.getByText("C:\\data")).toBeInTheDocument();
+  });
+
+  it("shows tabs when result is loaded", () => {
+    const { container } = render(
+      <FileFindingView {...defaultProps} result={makeScan()} />
+    );
+    const tabs = container.querySelectorAll(".tabs .tab");
+    const tabNames = Array.from(tabs).map((t) => t.textContent);
+    expect(tabNames).toContain("Find files");
+    expect(tabNames).toContain("Largest folders");
+  });
+
+  it("switches to folders tab and shows folder list", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <FileFindingView {...defaultProps} result={makeScan()} />
+    );
+    const foldersTab = Array.from(
+      container.querySelectorAll(".tabs .tab")
+    ).find((t) => t.textContent === "Largest folders")!;
+    await user.click(foldersTab);
+    const folderItems = container.querySelectorAll(".folder-list .list-item");
+    expect(folderItems.length).toBeGreaterThanOrEqual(1);
+  });
+});

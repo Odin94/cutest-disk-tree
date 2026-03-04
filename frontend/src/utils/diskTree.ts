@@ -106,9 +106,11 @@ const collectFileChildren = (parentPath: string, files: FileEntry[]): DiskTreeNo
 
 export const buildDiskTree = (
   scan: ScanResult,
+  startPath?: string,
   options?: BuildOptions
 ): DiskTreeNode | null => {
-  const rootSize = scan.folder_sizes[scan.root];
+  const root = startPath ?? (scan.roots.length > 0 ? scan.roots[0] : "");
+  const rootSize = scan.folder_sizes[root];
   if (rootSize == null) {
     return null;
   }
@@ -150,7 +152,7 @@ export const buildDiskTree = (
     };
   };
 
-  return buildNode(scan.root, 0);
+  return buildNode(root, 0);
 };
 
 export type DirectChild = {

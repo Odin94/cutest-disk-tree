@@ -42,7 +42,6 @@ pub enum DiskObjectKind {
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct DiskObject {
-    pub root: String,
     pub path: String,
     pub path_lower: String,
     pub parent_path: Option<String>,
@@ -59,8 +58,16 @@ pub struct DiskObject {
 
 #[derive(Debug, Serialize)]
 pub struct ScanResult {
-    pub root: String,
+    pub roots: Vec<String>,
     pub files: Vec<FileEntrySer>,
+    pub folder_sizes: HashMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScanSummary {
+    pub roots: Vec<String>,
+    pub files_count: u64,
+    pub folders_count: u64,
     pub folder_sizes: HashMap<String, u64>,
 }
 
@@ -156,10 +163,11 @@ fn build_parent_index(scan: &ScanResult) -> ParentIndex {
 
 pub fn build_disk_tree(
     scan: &ScanResult,
+    start_path: &str,
     max_children_per_node: usize,
     max_depth: usize,
 ) -> Option<DiskTreeNode> {
-    let _timings = build_disk_tree_timed(scan, max_children_per_node, max_depth);
+    let _timings = build_disk_tree_timed(scan, start_path, max_children_per_node, max_depth);
     _timings.0
 }
 
@@ -173,11 +181,12 @@ pub struct BuildTreeTimings {
 
 pub fn build_disk_tree_timed(
     scan: &ScanResult,
+    start_path: &str,
     max_children_per_node: usize,
     max_depth: usize,
 ) -> (Option<DiskTreeNode>, BuildTreeTimings) {
     use std::time::Instant;
-    let _root_size = match scan.folder_sizes.get(&scan.root).copied() {
+    let _root_size = match scan.folder_sizes.get(start_path).copied() {
         Some(s) => s,
         None => return (None, BuildTreeTimings::default()),
     };
@@ -290,7 +299,7 @@ pub fn build_disk_tree_timed(
     }
 
     let (node, timings) = build_node(
-        &scan.root,
+        start_path,
         0,
         scan,
         &index,
@@ -302,28 +311,27 @@ pub fn build_disk_tree_timed(
 
 pub fn build_disk_tree_from_db(
     conn: &rusqlite::Connection,
-    root: &str,
+    start_path: &str,
     max_children_per_node: usize,
     max_depth: usize,
 ) -> Option<DiskTreeNode> {
-    let size = db::get_root_size(conn, root).ok()??;
-    let (folders, files) = db::get_children_for_path(conn, root, root).ok()?;
+    let size = db::get_folder_size(conn, start_path).ok()??;
+    let (folders, files) = db::get_children_for_path(conn, start_path).ok()?;
     if folders.is_empty() && files.is_empty() {
         return None;
     }
-    build_node_from_db(conn, root, root, 0, max_depth, max_children_per_node, size)
+    build_node_from_db(conn, start_path, 0, max_depth, max_children_per_node, size)
 }
 
 fn build_node_from_db(
     conn: &rusqlite::Connection,
-    root: &str,
     path: &str,
     depth: usize,
     max_depth: usize,
     max_children: usize,
     size: u64,
 ) -> Option<DiskTreeNode> {
-    let (folders, files) = db::get_children_for_path(conn, root, path).ok()?;
+    let (folders, files) = db::get_children_for_path(conn, path).ok()?;
     let mut combined: Vec<(String, String, u64, bool)> = folders
         .into_iter()
         .map(|(p, s)| (p.clone(), basename(&p), s, true))
@@ -353,7 +361,6 @@ fn build_node_from_db(
             if is_folder {
                 build_node_from_db(
                     conn,
-                    root,
                     &child_path,
                     depth + 1,
                     max_depth,
@@ -448,7 +455,31 @@ pub struct FileEntry {
     pub mtime: Option<i64>,
 }
 
-const PROGRESS_INTERVAL: u64 = 200;
+const PROGRESS_INTERVAL: u64 = 5000;
+
+/// Returns the filesystem root paths for the current OS.
+/// On Windows, returns every drive letter that currently exists (e.g. `C:\`, `D:\`).
+/// On other platforms, returns `["/"]`.
+pub fn get_filesystem_roots() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut roots = Vec::new();
+        for letter in b'A'..=b'Z' {
+            let path = PathBuf::from(format!("{}:\\", letter as char));
+            if path.exists() {
+                roots.push(path);
+            }
+        }
+        if roots.is_empty() {
+            roots.push(PathBuf::from("C:\\"));
+        }
+        roots
+    }
+    #[cfg(not(windows))]
+    {
+        vec![PathBuf::from("/")]
+    }
+}
 
 pub fn index_directory(root: &Path) -> (Vec<FileEntry>, HashMap<std::path::PathBuf, u64>) {
     index_directory_with_progress(root, |_| {})
@@ -886,15 +917,15 @@ where
 
 pub fn index_directory_serializable(root: &Path) -> Option<ScanResult> {
     let (files, folder_sizes) = index_directory(root);
-    to_scan_result(root, &files, &folder_sizes)
+    to_scan_result(&[root], &files, &folder_sizes)
 }
 
 pub fn to_scan_result(
-    root: &Path,
+    roots: &[&Path],
     files: &[FileEntry],
     folder_sizes: &HashMap<std::path::PathBuf, u64>,
 ) -> Option<ScanResult> {
-    let root_str = root.to_string_lossy().to_string();
+    let roots_str: Vec<String> = roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
     let files_ser: Vec<FileEntrySer> = files
         .iter()
         .map(|entry| FileEntrySer {
@@ -909,7 +940,7 @@ pub fn to_scan_result(
         .map(|(p, s)| (p.to_string_lossy().to_string(), *s))
         .collect();
     Some(ScanResult {
-        root: root_str,
+        roots: roots_str,
         files: files_ser,
         folder_sizes: folder_sizes_ser,
     })
@@ -1163,62 +1194,4 @@ pub fn index_directory_lolcate_full(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    #[test]
-    fn build_disk_tree_creates_expected_structure() {
-        // Construct a small synthetic ScanResult:
-        //
-        // /root
-        //   /root/sub
-        //     /root/sub/file1 (size 10)
-        //   /root/file2 (size 5)
-        let root = "/root".to_string();
-
-        let files_ser = vec![
-            FileEntrySer {
-                path: "/root/sub/file1".to_string(),
-                size: 10,
-                file_key: FileKey { dev: 1, ino: 1 },
-                mtime: None,
-            },
-            FileEntrySer {
-                path: "/root/file2".to_string(),
-                size: 5,
-                file_key: FileKey { dev: 1, ino: 2 },
-                mtime: None,
-            },
-        ];
-
-        let mut folder_sizes: HashMap<String, u64> = HashMap::new();
-        folder_sizes.insert("/root".to_string(), 15);
-        folder_sizes.insert("/root/sub".to_string(), 10);
-
-        let scan = ScanResult {
-            root: root.clone(),
-            files: files_ser,
-            folder_sizes,
-        };
-
-        let (tree_opt, _timings) = build_disk_tree_timed(&scan, 10, 10);
-        let tree = tree_opt.expect("tree should be built");
-
-        fn collect_paths(node: &DiskTreeNode, out: &mut Vec<(String, u64, bool)>) {
-            out.push((node.path.clone(), node.size, node.children.is_some()));
-            if let Some(children) = &node.children {
-                for child in children {
-                    collect_paths(child, out);
-                }
-            }
-        }
-
-        let mut all: Vec<(String, u64, bool)> = Vec::new();
-        collect_paths(&tree, &mut all);
-
-        // Root and subfolder sizes must match the synthetic folder_sizes map.
-        assert!(all.iter().any(|(p, s, _)| p == "/root" && *s == 15));
-        assert!(all.iter().any(|(p, s, _)| p == "/root/sub" && *s == 10));
-    }
-}
+mod tests;

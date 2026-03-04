@@ -1,16 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
-import type { ScanResult, ScanProgress, FileSearchResult, FolderSizesReady } from "./types";
+import type { ScanDirectoryResponse, ScanProgress, FileSearchResult, FolderSizesReady } from "./types";
 import type { DiskTreeNode } from "./utils/diskTree";
 
 export const buildDiskTreeCached = (
-  root: string,
+  startPath: string,
   maxChildrenPerNode: number,
   maxDepth: number
 ): Promise<DiskTreeNode | null> =>
   invoke("build_disk_tree_cached", {
-    root,
+    startPath,
     maxChildrenPerNode,
     maxDepth,
   });
@@ -26,8 +25,12 @@ export const debugLogStats = (message: string): void => {
   invoke("debug_log_stats", { message }).catch(() => {});
 };
 
-export const scanDirectory = (path: string): Promise<ScanResult> =>
-  invoke("scan_directory", { path });
+export const scanDirectory = (): Promise<ScanDirectoryResponse> => {
+  const stack = new Error().stack ?? "(no stack)";
+  console.error(`[scanDirectory] invoke called.\n${stack}`);
+  debugLog(`scanDirectory invoked stack=${stack.split("\n").slice(0, 5).join(" | ")}`);
+  return invoke("scan_directory", {});
+};
 
 export const onScanProgress = (callback: (progress: ScanProgress) => void) => {
   const unlisten = listen<ScanProgress>("scan-progress", (event) => {
@@ -52,17 +55,20 @@ export const onScanFolderSizesReady = (
   return unlisten;
 };
 
-export const listCachedRoots = (): Promise<string[]> =>
-  invoke("list_cached_roots", {});
+export type CachedScanSummary = {
+  roots: string[];
+  files_count: number;
+  folders_count: number;
+  folder_sizes: Record<string, number>;
+};
 
-export const loadCachedScan = (root: string): Promise<ScanResult | null> =>
-  invoke("load_cached_scan", { root });
+export const loadCachedScan = (): Promise<CachedScanSummary | null> =>
+  invoke("load_cached_scan", {});
 
 export const listCachedTreeDepths = (
-  root: string,
   maxChildrenPerNode: number
 ): Promise<number[]> =>
-  invoke("list_cached_tree_depths", { root, maxChildren: maxChildrenPerNode });
+  invoke("list_cached_tree_depths", { maxChildren: maxChildrenPerNode });
 
 export type FindFilesResponse = {
   items: FileSearchResult[];
@@ -70,7 +76,6 @@ export type FindFilesResponse = {
 };
 
 export const findFiles = (
-  root: string,
   query: string,
   extensions: string,
   useFuzzy: boolean,
@@ -78,18 +83,9 @@ export const findFiles = (
   offset?: number
 ): Promise<FindFilesResponse> =>
   invoke("find_files", {
-    root,
     query,
     extensions: extensions.trim().length > 0 ? extensions : null,
     limit: limit ?? 500,
     use_fuzzy: useFuzzy,
     offset: offset ?? 0,
   });
-
-export const pickDirectory = async (): Promise<string | null> => {
-  const selected = await open({
-    directory: true,
-    multiple: false,
-  });
-  return selected ?? null;
-};

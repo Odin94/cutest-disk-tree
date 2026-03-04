@@ -53,10 +53,10 @@ fn to_scan_result_produces_serializable_result() {
     std::fs::write(root.join("x.txt"), b"data").unwrap();
 
     let (files, folder_sizes) = index_directory(root);
-    let result = to_scan_result(root, &files, &folder_sizes).unwrap();
+    let result = to_scan_result(&[root], &files, &folder_sizes).unwrap();
 
     assert_eq!(result.files.len(), 1);
     assert_eq!(result.files[0].size, 4);
     assert_eq!(result.folder_sizes.len(), 1);
-    assert!(!result.root.is_empty());
+    assert!(!result.roots.is_empty());
 }

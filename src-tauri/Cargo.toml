@@ -21,6 +21,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 suffix = "1"
 dotenvy = "0.15"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = [ "custom-protocol" ]
 custom-protocol = [ "tauri/custom-protocol" ]

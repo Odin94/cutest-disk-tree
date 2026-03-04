@@ -21,4 +21,11 @@ export default defineConfig({
         minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
         sourcemap: !!process.env.TAURI_ENV_DEBUG,
     },
+    test: {
+        environment: "jsdom",
+        globals: true,
+        root: ".",
+        setupFiles: ["./frontend/src/__tests__/setup.ts"],
+        include: ["frontend/src/**/*.test.{ts,tsx}"],
+    },
 })

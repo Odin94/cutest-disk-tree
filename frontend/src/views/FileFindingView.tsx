@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { debugLog, findFiles, listCachedRoots } from "../api";
+import { debugLog, findFiles } from "../api";
 import { Button } from "../components/ui/button";
 import type { FileSearchResult, ScanProgress, ScanResult } from "../types";
-import { humanSize, progressTopLevelFolder } from "../utils";
+import { humanSize } from "../utils";
 import { FindResultsTable } from "./FileFindingView/FindResultsTable";
 
-type TabId = "folders" | "files" | "duplicates" | "find";
+type TabId = "folders" | "find";
 export type FindSortKey = "name" | "size" | "path";
 export type FindSortDirection = "asc" | "desc";
 type FileCategory =
@@ -27,10 +27,8 @@ type FileFindingViewProps = {
   loading: boolean;
   error: string | null;
   progress: ScanProgress | null;
-  scanRootPath: string | null;
   onScan: () => void;
   onCancelScan?: () => void;
-  onSelectCachedRoot?: (root: string) => Promise<void>;
 };
 
 export const getFileName = (path: string): string => {
@@ -44,10 +42,8 @@ export const FileFindingView = ({
   loading,
   error,
   progress,
-  scanRootPath,
   onScan,
   onCancelScan,
-  onSelectCachedRoot,
 }: FileFindingViewProps) => {
   const renderT0 = performance.now();
   const [activeTab, setActiveTab] = useState<TabId>("find");
@@ -64,9 +60,7 @@ export const FileFindingView = ({
   const [findSortKey, setFindSortKey] = useState<FindSortKey>("name");
   const [findSortDirection, setFindSortDirection] =
     useState<FindSortDirection>("asc");
-  const [cachedRoots, setCachedRoots] = useState<string[]>([]);
   const lastQueryRef = useRef<{
-    root: string;
     query: string;
     extensions: string;
     category: FileCategory;
@@ -74,52 +68,33 @@ export const FileFindingView = ({
   } | null>(null);
 
   useEffect(() => {
-    listCachedRoots().then(setCachedRoots);
-  }, [result?.root]);
-
-  useEffect(() => {
     lastQueryRef.current = null;
-  }, [result?.root]);
+  }, [result]);
 
-  const { uniqueCount, uniqueSize, folderList, largestFiles } = useMemo(() => {
+  const { filesCount, folderList } = useMemo(() => {
     if (result === null) {
       return {
-        uniqueCount: 0,
-        uniqueSize: 0,
+        filesCount: 0,
         folderList: [] as { path: string; size: number }[],
-        largestFiles: [] as FileSearchResult[],
       };
     }
 
     const t0 = performance.now();
 
-    const seen = new Set<string>();
-    let sum = 0;
-    for (const f of result.files) {
-      const k = `${f.file_key.dev}:${f.file_key.ino}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      sum += f.size;
-    }
+    const filesCount = result.files_count ?? result.files.length;
 
     const folders = Object.entries(result.folder_sizes)
       .map(([path, size]) => ({ path, size }))
       .sort((a, b) => b.size - a.size);
 
-    const largest = [...result.files]
-      .sort((a, b) => b.size - a.size)
-      .slice(0, MAX_VISIBLE_FILES);
-
     const ms = (performance.now() - t0).toFixed(1);
     debugLog(
-      `find_ui summary_compute ms=${ms} files=${result.files.length} folders=${folders.length}`
+      `find_ui summary_compute ms=${ms} files_count=${filesCount} folders=${folders.length}`
     );
 
     return {
-      uniqueCount: seen.size,
-      uniqueSize: sum,
+      filesCount,
       folderList: folders,
-      largestFiles: largest,
     };
   }, [result]);
 
@@ -145,7 +120,6 @@ export const FileFindingView = ({
     if (!canSearch || result === null) return;
     const extension = getEffectiveExtensions();
     const queryKey = {
-      root: result.root,
       query: searchQuery,
       extensions: extension,
       category: searchCategory,
@@ -153,7 +127,6 @@ export const FileFindingView = ({
     };
     if (
       lastQueryRef.current &&
-      lastQueryRef.current.root === queryKey.root &&
       lastQueryRef.current.query === queryKey.query &&
       lastQueryRef.current.extensions === queryKey.extensions &&
       lastQueryRef.current.category === queryKey.category &&
@@ -164,7 +137,7 @@ export const FileFindingView = ({
     }
     const reqT0 = performance.now();
     debugLog(
-      `find_ui find_files request start root=${result.root} query_len=${searchQuery.length} ext=${extension.length > 0 ? "yes" : "no"} fuzzy=${useFuzzySearch ? "on" : "off"}`
+      `find_ui find_files request start query_len=${searchQuery.length} ext=${extension.length > 0 ? "yes" : "no"} fuzzy=${useFuzzySearch ? "on" : "off"}`
     );
     setSearchLoading(true);
     setSearchLoadingMore(false);
@@ -174,7 +147,6 @@ export const FileFindingView = ({
     setSearchError(null);
     try {
       const response = await findFiles(
-        result.root,
         searchQuery,
         extension,
         useFuzzySearch,
@@ -203,7 +175,6 @@ export const FileFindingView = ({
     const timeoutId = window.setTimeout(() => {
       const extension = getEffectiveExtensions();
       const queryKey = {
-        root: result.root,
         query: searchQuery,
         extensions: extension,
         category: searchCategory,
@@ -211,7 +182,6 @@ export const FileFindingView = ({
       };
       if (
         lastQueryRef.current &&
-        lastQueryRef.current.root === queryKey.root &&
         lastQueryRef.current.query === queryKey.query &&
         lastQueryRef.current.extensions === queryKey.extensions &&
         lastQueryRef.current.category === queryKey.category &&
@@ -222,7 +192,7 @@ export const FileFindingView = ({
       }
       const reqT0 = performance.now();
       debugLog(
-        `find_ui find_files request start (debounced) root=${result.root} query_len=${searchQuery.length} ext=${extension.length > 0 ? "yes" : "no"} fuzzy=${useFuzzySearch ? "on" : "off"}`
+        `find_ui find_files request start (debounced) query_len=${searchQuery.length} ext=${extension.length > 0 ? "yes" : "no"} fuzzy=${useFuzzySearch ? "on" : "off"}`
       );
       setSearchLoading(true);
       setSearchLoadingMore(false);
@@ -230,7 +200,7 @@ export const FileFindingView = ({
       setSearchNextOffset(null);
       setSearchTotalCount(null);
       setSearchError(null);
-      findFiles(result.root, searchQuery, extension, useFuzzySearch, PAGE_SIZE, 0)
+      findFiles(searchQuery, extension, useFuzzySearch, PAGE_SIZE, 0)
         .then((response) => {
           lastQueryRef.current = queryKey;
           const elapsed = (performance.now() - reqT0).toFixed(0);
@@ -251,7 +221,6 @@ export const FileFindingView = ({
   }, [
     activeTab,
     canSearch,
-    result?.root,
     searchQuery,
     searchExtensions,
     searchCategory,
@@ -333,28 +302,19 @@ export const FileFindingView = ({
     if (!canSearch || result === null) return;
     if (!canLoadMore) return;
     const extension = getEffectiveExtensions();
-    const queryKey = {
-      root: result.root,
-      query: searchQuery,
-      extensions: extension,
-      category: searchCategory,
-      fuzzy: useFuzzySearch,
-    };
     const reqT0 = performance.now();
     debugLog(
-      `find_ui find_files request load_more root=${result.root} query_len=${searchQuery.length} ext=${extension.length > 0 ? "yes" : "no"} fuzzy=${useFuzzySearch ? "on" : "off"} offset=${searchNextOffset}`
+      `find_ui find_files request load_more query_len=${searchQuery.length} ext=${extension.length > 0 ? "yes" : "no"} fuzzy=${useFuzzySearch ? "on" : "off"} offset=${searchNextOffset}`
     );
     setSearchLoadingMore(true);
     try {
       const response = await findFiles(
-        result.root,
         searchQuery,
         extension,
         useFuzzySearch,
         PAGE_SIZE,
         searchNextOffset ?? 0
       );
-      lastQueryRef.current = queryKey;
       const elapsed = (performance.now() - reqT0).toFixed(0);
       debugLog(
         `find_ui find_files response received load_more count=${response.items.length} nextOffset=${response.nextOffset ?? "null"} elapsedMs=${elapsed}`
@@ -384,45 +344,22 @@ export const FileFindingView = ({
     });
   }, []);
 
-  const loadCached = async (root: string) => {
-    if (onSelectCachedRoot) await onSelectCachedRoot(root);
-  };
-
   const view = (
     <>
       <div className="file-finding-actions">
         <Button
           type="button"
           onClick={() => {
-            debugLog("FileFindingView click Choose folder to scan");
+            debugLog("FileFindingView click Scan filesystem");
             onScan();
           }}
           disabled={loading}
         >
-          {loading ? "Scanning…" : "Choose folder to scan"}
+          {loading ? "Scanning…" : "Scan filesystem"}
         </Button>
-        {cachedRoots.length > 1 ? (
-          <select
-            className="disk-usage-root-select"
-            value={result?.root ?? ""}
-            onChange={(e) => {
-              const root = e.target.value;
-              debugLog(`FileFindingView select root value=${root || "(empty)"}`);
-              if (root) loadCached(root);
-            }}
-            title="Select previously scanned root"
-          >
-            <option value="">Select cached root…</option>
-            {cachedRoots.map((root) => (
-              <option key={root} value={root}>
-                {root}
-              </option>
-            ))}
-          </select>
-        ) : null}
       </div>
 
-      {error ? <div className="error">{error}</div> : null}
+      {error != null ? <div className="error">{error}</div> : null}
 
       {loading ? (
         <div className="progress-panel">
@@ -446,17 +383,6 @@ export const FileFindingView = ({
               <p className="progress-text">
                 {`${progress.files_count.toLocaleString()} files scanned`}
               </p>
-              {progressTopLevelFolder(
-                scanRootPath,
-                progress.current_path ?? null
-              ) != null ? (
-                <p className="progress-path">
-                  {`Top-level folder: ${progressTopLevelFolder(
-                    scanRootPath,
-                    progress.current_path ?? null
-                  )}`}
-                </p>
-              ) : null}
               {progress.current_path != null ? (
                 <p className="progress-path" title={progress.current_path}>
                   {progress.current_path}
@@ -464,7 +390,7 @@ export const FileFindingView = ({
               ) : null}
             </>
           ) : null}
-          {onCancelScan ? (
+          {onCancelScan != null ? (
             <p className="progress-actions">
               <Button
                 type="button"
@@ -486,23 +412,17 @@ export const FileFindingView = ({
         <>
           <section className="summary">
             <div className="summary-row">
-              <span className="label">Root:</span>
-              <span className="path">{result.root}</span>
+              <span className="label">Scanned roots:</span>
+              <span className="path">{result.roots.join(", ")}</span>
             </div>
             <div className="summary-row">
-              <span className="label">File entries:</span>
-              <span>{result.files.length.toLocaleString()}</span>
-            </div>
-            <div className="summary-row">
-              <span className="label">Unique files (hard links deduped):</span>
-              <span>
-                {uniqueCount.toLocaleString()} ({humanSize(uniqueSize)})
-              </span>
+              <span className="label">Files scanned:</span>
+              <span>{filesCount.toLocaleString()}</span>
             </div>
           </section>
 
           <div className="tabs">
-            {(["find", "folders", "files", "duplicates"] as const).map(
+            {(["find", "folders"] as const).map(
               (tab) => (
                 <button
                   key={tab}
@@ -512,22 +432,14 @@ export const FileFindingView = ({
                     const label =
                       tab === "folders"
                         ? "Largest folders"
-                        : tab === "files"
-                          ? "Largest files"
-                          : tab === "duplicates"
-                            ? "Duplicates"
-                            : "Find files";
+                        : "Find files";
                     debugLog(`FileFindingView click tab ${tab} (${label})`);
                     setActiveTab(tab);
                   }}
                 >
                   {tab === "folders"
                     ? "Largest folders"
-                    : tab === "files"
-                      ? "Largest files"
-                      : tab === "duplicates"
-                        ? "Duplicates"
-                        : "Find files"}
+                    : "Find files"}
                 </button>
               )
             )}
@@ -543,30 +455,6 @@ export const FileFindingView = ({
                   </li>
                 ))}
               </ul>
-            ) : activeTab === "files" ? (
-              <div className="file-list-wrap">
-                <ul className="list file-list">
-                  {largestFiles.map((f) => (
-                    <li key={f.path} className="list-item">
-                      <span className="size">{humanSize(f.size)}</span>
-                      <span className="path">{f.path}</span>
-                    </li>
-                  ))}
-                </ul>
-                {result.files.length > MAX_VISIBLE_FILES ? (
-                  <p className="list-status">
-                    {`Showing largest ${MAX_VISIBLE_FILES.toLocaleString()} files out of ${result.files.length.toLocaleString()} total.`}
-                  </p>
-                ) : null}
-              </div>
-            ) : activeTab === "duplicates" ? (
-              <div className="placeholder">
-                <p>Duplicate detection will group files by content hash.</p>
-                <p>
-                  Hashing is not implemented yet; run from CLI to index, then
-                  add hashing in a later step.
-                </p>
-              </div>
             ) : (
               <div className="find-panel">
                 <form className="find-form" onSubmit={runSearch}>
@@ -651,8 +539,7 @@ export const FileFindingView = ({
                   </div>
                   <p className="find-help">
                     Uses fast substring matching by default; enable fuzzy search
-                    to use nucleo-based fuzzy matching against the indexed files
-                    for this root.
+                    to use nucleo-based fuzzy matching against the indexed files.
                   </p>
                 </form>
                 {searchError !== null ? (
@@ -683,7 +570,7 @@ export const FileFindingView = ({
         </>
       ) : loading ? null : (
         <div className="empty">
-          Click &quot;Choose folder to scan&quot; to start.
+          Click &quot;Scan filesystem&quot; to start.
         </div>
       )}
     </>

@@ -1,5 +1,6 @@
 use cutest_disk_tree::{db, DiskObject, DiskObjectKind};
 use cutest_disk_tree::core::indexing::suffix::{SuffixIndex, build_suffix_index, search_suffix_index};
+use cutest_disk_tree::core::indexing::sqlite::search_disk_objects_by_name;
 use std::collections::{HashMap, HashSet};
 use suffix::SuffixTable;
 use std::sync::{Arc, Mutex};
@@ -853,6 +854,17 @@ fn find_files(
     use_fuzzy: Option<bool>,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
+    find_files_in_memory(&state, query, extensions, limit, use_fuzzy, offset)
+}
+
+fn find_files_in_memory(
+    state: &tauri::State<AppState>,
+    query: String,
+    extensions: Option<String>,
+    limit: Option<u32>,
+    use_fuzzy: Option<bool>,
+    offset: Option<u32>,
+) -> Result<FindFilesResponse, String> {
     const DEFAULT_LIMIT: u32 = 500;
     let limit = limit.unwrap_or(DEFAULT_LIMIT) as usize;
     let use_fuzzy = use_fuzzy.unwrap_or(true);
@@ -860,7 +872,7 @@ fn find_files(
     let total_start = Instant::now();
 
     write_debug_log(
-        &state,
+        state,
         &format!(
             ">>> find_files start query_len={} limit={}",
             query.len(),
@@ -873,7 +885,7 @@ fn find_files(
         if let Some(entries) = guard.as_ref() {
             let t = total_start.elapsed().as_millis();
             write_debug_log(
-                &state,
+                state,
                 &format!(
                     "find_files index from_cache count={} ms={}",
                     entries.len(),
@@ -883,7 +895,7 @@ fn find_files(
             entries.clone()
         } else {
             write_debug_log(
-                &state,
+                state,
                 "find_files no_active_index (returning empty results)",
             );
             return Ok(FindFilesResponse {
@@ -933,7 +945,7 @@ fn find_files(
 
     let ext_filter_ms = ext_filter_start.elapsed().as_millis();
     write_debug_log(
-        &state,
+        state,
         &format!(
             "find_files after_ext_filter allowed_count={} total_entries={} has_ext_filter={} ext_filter_ms={}",
             allowed_count, disk_entries.len(), extension_set.is_some(), ext_filter_ms
@@ -943,7 +955,7 @@ fn find_files(
     if start_index >= disk_entries.len() {
         let total_ms = total_start.elapsed().as_millis();
         write_debug_log(
-            &state,
+            state,
             &format!(
                 "find_files empty_page start_index={} total_entries={} total_ms={}",
                 start_index, disk_entries.len(), total_ms
@@ -964,7 +976,7 @@ fn find_files(
         let collect_ms = collect_start.elapsed().as_millis();
         let total_ms = total_start.elapsed().as_millis();
         write_debug_log(
-            &state,
+            state,
             &format!(
                 "find_files done empty_query count={} start_index={} next_offset={:?} collect_take_ms={} total_ms={}",
                 items.len(), start_index, next_offset, collect_ms, total_ms
@@ -988,7 +1000,7 @@ fn find_files(
             .and_then(|idx| search_suffix_index(idx.as_ref(), &q))
     };
     let suffix_search_ms = suffix_search_start.elapsed().as_millis();
-    write_debug_log(&state, &format!(
+    write_debug_log(state, &format!(
         "find_files suffix_search q_len={} candidates={} ms={}",
         q_len,
         candidate_set_opt.as_ref().map(|s| s.len()).unwrap_or(0),
@@ -1020,7 +1032,7 @@ fn find_files(
             "short_query_fuzzy"
         };
         write_debug_log(
-            &state,
+            state,
             &format!(
                 "find_files {} q_len={} count={} start_index={} next_offset={:?} results_build_ms={} total_ms={}",
                 label, q_len, items.len(), start_index, next_offset, build_ms, total_ms,
@@ -1074,7 +1086,7 @@ fn find_files(
         let select_ms = select_start.elapsed().as_millis();
         let total_ms = total_start.elapsed().as_millis();
         write_debug_log(
-            &state,
+            state,
             &format!(
                 "find_files nucleo_done q_len={} scored={} taken={} nucleo_ms={} select_build_ms={} total_ms={}",
                 q_len, scored_len, items.len(), nucleo_ms, select_ms, total_ms,
@@ -1085,6 +1097,97 @@ fn find_files(
             next_offset: None,
         });
     }
+}
+
+fn find_files_in_db(
+    state: &tauri::State<AppState>,
+    query: String,
+    extensions: Option<String>,
+    limit: Option<u32>,
+    _use_fuzzy: Option<bool>,
+    _offset: Option<u32>,
+) -> Result<FindFilesResponse, String> {
+    const DEFAULT_LIMIT: u32 = 500;
+    let limit = limit.unwrap_or(DEFAULT_LIMIT) as usize;
+
+    let total_start = Instant::now();
+
+    write_debug_log(
+        state,
+        &format!(
+            ">>> find_files_in_db start query_len={} limit={}",
+            query.len(),
+            limit
+        ),
+    );
+
+    let db_path = state.db_path.clone();
+    let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
+
+    let disk_entries = search_disk_objects_by_name(&conn, &query, limit)
+        .map_err(|e| e.to_string())?;
+
+    let ext_filter_start = Instant::now();
+    let extension_set: Option<std::collections::HashSet<String>> = extensions.as_ref().and_then(|s| {
+        let cleaned: Vec<String> = s
+            .split(',')
+            .map(|x| x.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|x| !x.is_empty())
+            .collect();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.into_iter().collect())
+        }
+    });
+
+    let filtered_entries: Vec<DiskObject> = match &extension_set {
+        None => disk_entries,
+        Some(set) => disk_entries
+            .into_iter()
+            .filter(|o| {
+                match o.kind {
+                    DiskObjectKind::File => o
+                        .ext
+                        .as_ref()
+                        .map(|t| set.contains(t))
+                        .unwrap_or(false),
+                    DiskObjectKind::Folder => true,
+                }
+            })
+            .collect(),
+    };
+
+    let ext_filter_ms = ext_filter_start.elapsed().as_millis();
+    write_debug_log(
+        state,
+        &format!(
+            "find_files_in_db after_ext_filter count={} ext_filter_ms={}",
+            filtered_entries.len(),
+            ext_filter_ms
+        ),
+    );
+
+    let items: Vec<SearchEntry> = filtered_entries
+        .iter()
+        .take(limit)
+        .map(|o| search_entry_from_disk_object(o))
+        .collect();
+
+    let total_ms = total_start.elapsed().as_millis();
+    write_debug_log(
+        state,
+        &format!(
+            "find_files_in_db done count={} total_ms={}",
+            items.len(),
+            total_ms
+        ),
+    );
+
+    Ok(FindFilesResponse {
+        items,
+        next_offset: None,
+    })
 }
 
 fn load_dotenv_from_repo() {

@@ -17,6 +17,7 @@ pub struct GetScanTimings {
 const SECONDARY_INDEXES: &[&str] = &[
     "idx_disk_objects_parent_kind",
     "idx_disk_objects_kind_ext",
+    "idx_disk_objects_kind_ext_name_lower",
     "idx_disk_objects_dev_ino",
     "idx_disk_objects_path_lower",
     "idx_disk_objects_name_lower",
@@ -25,6 +26,7 @@ const SECONDARY_INDEXES: &[&str] = &[
 const CREATE_SECONDARY_INDEXES: &[&str] = &[
     "CREATE INDEX idx_disk_objects_parent_kind ON disk_objects(parent_path, kind)",
     "CREATE INDEX idx_disk_objects_kind_ext ON disk_objects(kind, ext)",
+    "CREATE INDEX idx_disk_objects_kind_ext_name_lower ON disk_objects(kind, ext, name_lower)",
     "CREATE INDEX idx_disk_objects_dev_ino ON disk_objects(dev, ino)",
     "CREATE INDEX idx_disk_objects_path_lower ON disk_objects(path_lower)",
     "CREATE INDEX idx_disk_objects_name_lower ON disk_objects(name_lower)",
@@ -548,7 +550,12 @@ pub fn open_db(db_path: &Path) -> rusqlite::Result<Connection> {
         };
     }
 
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; \
+         PRAGMA synchronous=NORMAL; \
+         PRAGMA cache_size=-32000; \
+         PRAGMA temp_store=MEMORY;"
+    )?;
     conn.busy_timeout(Duration::from_millis(5000))?;
 
     Ok(conn)

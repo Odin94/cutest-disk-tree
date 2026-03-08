@@ -1,6 +1,7 @@
 use cutest_disk_tree::{db, DiskObject, DiskObjectKind};
 use cutest_disk_tree::core::indexing::suffix::{SuffixIndex, build_suffix_index, search_suffix_index};
-use cutest_disk_tree::core::indexing::sqlite::search_disk_objects_by_name;
+use cutest_disk_tree::core::indexing::sqlite::{search_disk_objects_by_name, SearchFilter};
+use cutest_disk_tree::core::search_category;
 use std::collections::{HashMap, HashSet};
 use suffix::SuffixTable;
 use std::sync::{Arc, Mutex};
@@ -943,7 +944,7 @@ fn find_files(
     use_fuzzy: Option<bool>,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
-    find_files_in_memory(&state, query, extensions, category, limit, use_fuzzy, offset)
+    find_files_in_db(&state, query, extensions, category, limit, use_fuzzy, offset)
 }
 
 fn find_files_in_memory(
@@ -1202,36 +1203,11 @@ fn find_files_in_memory(
     }
 }
 
-fn find_files_in_db(
-    state: &tauri::State<AppState>,
-    query: String,
-    extensions: Option<String>,
-    limit: Option<u32>,
-    _use_fuzzy: Option<bool>,
-    _offset: Option<u32>,
-) -> Result<FindFilesResponse, String> {
-    const DEFAULT_LIMIT: u32 = 500;
-    let limit = limit.unwrap_or(DEFAULT_LIMIT) as usize;
-
-    let total_start = Instant::now();
-
-    write_debug_log(
-        state,
-        &format!(
-            ">>> find_files_in_db start query_len={} limit={}",
-            query.len(),
-            limit
-        ),
-    );
-
-    let db_path = state.db_path.clone();
-    let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
-
-    let disk_entries = search_disk_objects_by_name(&conn, &query, limit)
-        .map_err(|e| e.to_string())?;
-
-    let ext_filter_start = Instant::now();
-    let extension_set: Option<std::collections::HashSet<String>> = extensions.as_ref().and_then(|s| {
+fn resolve_search_filter(
+    extensions: Option<&str>,
+    category: Option<&str>,
+) -> SearchFilter {
+    let manual_exts: Option<Vec<String>> = extensions.and_then(|s| {
         let cleaned: Vec<String> = s
             .split(',')
             .map(|x| x.trim().trim_start_matches('.').to_ascii_lowercase())
@@ -1240,56 +1216,110 @@ fn find_files_in_db(
         if cleaned.is_empty() {
             None
         } else {
-            Some(cleaned.into_iter().collect())
+            Some(cleaned)
         }
     });
 
-    let filtered_entries: Vec<DiskObject> = match &extension_set {
-        None => disk_entries,
-        Some(set) => disk_entries
-            .into_iter()
-            .filter(|o| {
-                match o.kind {
-                    DiskObjectKind::File => o
-                        .ext
-                        .as_ref()
-                        .map(|t| set.contains(t))
-                        .unwrap_or(false),
-                    DiskObjectKind::Folder => true,
-                }
-            })
-            .collect(),
-    };
+    if let Some(exts) = manual_exts {
+        return SearchFilter::Extensions(exts);
+    }
 
-    let ext_filter_ms = ext_filter_start.elapsed().as_millis();
+    let category = category
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && s != "all");
+    let cat = category.as_deref();
+
+    match cat {
+        None => SearchFilter::None,
+        Some("folder") => SearchFilter::FoldersOnly,
+        Some("other") => SearchFilter::Other,
+        Some(c) => {
+            if let Some(exts) = search_category::extension_set(c) {
+                SearchFilter::Extensions(exts.iter().map(|s| (*s).to_string()).collect())
+            } else {
+                SearchFilter::None
+            }
+        }
+    }
+}
+
+fn find_files_in_db(
+    state: &tauri::State<AppState>,
+    query: String,
+    extensions: Option<String>,
+    category: Option<String>,
+    limit: Option<u32>,
+    _use_fuzzy: Option<bool>,
+    offset: Option<u32>,
+) -> Result<FindFilesResponse, String> {
+    const DEFAULT_LIMIT: u32 = 500;
+    let limit = limit.unwrap_or(DEFAULT_LIMIT) as usize;
+    let offset = offset.unwrap_or(0) as usize;
+
+    let total_start = Instant::now();
+
     write_debug_log(
         state,
         &format!(
-            "find_files_in_db after_ext_filter count={} ext_filter_ms={}",
-            filtered_entries.len(),
-            ext_filter_ms
+            ">>> find_files_in_db start query_len={} limit={} offset={} category={:?}",
+            query.len(),
+            limit,
+            offset,
+            category.as_deref()
         ),
     );
 
-    let items: Vec<SearchEntry> = filtered_entries
+    let db_path = state.db_path.clone();
+    let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
+
+    let resolve_start = Instant::now();
+    let filter = resolve_search_filter(extensions.as_deref(), category.as_deref());
+    let resolve_ms = resolve_start.elapsed().as_millis();
+
+    let db_start = Instant::now();
+    let (disk_entries, has_more, sql_timings) = search_disk_objects_by_name(
+        &conn,
+        &query,
+        &filter,
+        limit,
+        offset,
+    )
+    .map_err(|e| e.to_string())?;
+    let db_total_ms = db_start.elapsed().as_millis();
+
+    let serialize_start = Instant::now();
+    let items: Vec<SearchEntry> = disk_entries
         .iter()
-        .take(limit)
         .map(|o| search_entry_from_disk_object(o))
         .collect();
+    let serialize_ms = serialize_start.elapsed().as_millis();
+
+    let next_offset = if has_more {
+        Some(offset + limit)
+    } else {
+        None
+    };
 
     let total_ms = total_start.elapsed().as_millis();
     write_debug_log(
         state,
         &format!(
-            "find_files_in_db done count={} total_ms={}",
+            "find_files_in_db profile resolve_ms={} db_total_ms={} (sql prepare_ms={} query_map_ms={} collect_ms={}) serialize_ms={} total_ms={} count={} next_offset={:?}",
+            resolve_ms,
+            db_total_ms,
+            sql_timings.prepare_ms,
+            sql_timings.query_map_ms,
+            sql_timings.collect_ms,
+            serialize_ms,
+            total_ms,
             items.len(),
-            total_ms
+            next_offset
         ),
     );
 
     Ok(FindFilesResponse {
         items,
-        next_offset: None,
+        next_offset,
     })
 }
 

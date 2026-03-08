@@ -144,11 +144,17 @@ DROP TABLE suffix_index_data;
 ALTER TABLE suffix_index_data_new RENAME TO suffix_index_data;
 "#;
 
+pub const MIGRATION_4_SEARCH_INDEX: &str = r#"
+-- Composite index for name search with kind/ext filter: planner can narrow by (kind, ext) then scan name_lower.
+CREATE INDEX IF NOT EXISTS idx_disk_objects_kind_ext_name_lower ON disk_objects(kind, ext, name_lower);
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_1_INITIAL_SCHEMA),
         M::up(MIGRATION_2_SCAN_METADATA),
         M::up(MIGRATION_3_REMOVE_ROOT),
+        M::up(MIGRATION_4_SEARCH_INDEX),
     ])
 }
 

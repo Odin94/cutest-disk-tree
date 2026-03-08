@@ -78,13 +78,15 @@ export type FindFilesResponse = {
 export const findFiles = (
   query: string,
   extensions: string,
+  category: string,
   useFuzzy: boolean,
   limit?: number,
   offset?: number
 ): Promise<FindFilesResponse> =>
   invoke("find_files", {
     query,
-    extensions: extensions.trim().length > 0 ? extensions : null,
+    extensions: extensions.trim().length > 0 ? extensions.trim() : null,
+    category: category.trim() !== "" && category !== "all" ? category : null,
     limit: limit ?? 500,
     use_fuzzy: useFuzzy,
     offset: offset ?? 0,

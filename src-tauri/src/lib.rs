@@ -15,6 +15,94 @@ use serde::Serialize;
 use std::io::Write;
 use sysinfo::{Pid, System};
 
+mod category_filter {
+    use cutest_disk_tree::{DiskObject, DiskObjectKind};
+    use std::collections::HashSet;
+
+    const AUDIO: &[&str] = &["mp3", "wav", "flac", "m4a", "ogg", "aac", "opus"];
+    const DOCUMENT: &[&str] = &[
+        "pdf", "txt", "md", "rtf", "doc", "docx", "odt", "xls", "xlsx", "csv",
+        "ppt", "pptx",
+    ];
+    const VIDEO: &[&str] = &["mp4", "mkv", "mov", "avi", "webm", "m4v"];
+    const IMAGE: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "tiff", "svg"];
+    const EXECUTABLE: &[&str] = &[
+        "exe", "dll", "so", "dylib", "bin", "sh", "bat", "cmd", "appimage",
+    ];
+    const COMPRESSED: &[&str] = &["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz"];
+    const CONFIG: &[&str] = &[
+        "cfg", "conf", "ini", "json", "yaml", "yml", "toml", "xml", "props",
+        "properties", "rc", "config", "env",
+    ];
+
+    fn all_known_extensions() -> HashSet<&'static str> {
+        AUDIO
+            .iter()
+            .chain(DOCUMENT)
+            .chain(VIDEO)
+            .chain(IMAGE)
+            .chain(EXECUTABLE)
+            .chain(COMPRESSED)
+            .chain(CONFIG)
+            .copied()
+            .collect()
+    }
+
+    fn extension_set(category: &str) -> Option<HashSet<&'static str>> {
+        let set: HashSet<&str> = match category {
+            "audio" => AUDIO.iter().copied().collect(),
+            "document" => DOCUMENT.iter().copied().collect(),
+            "video" => VIDEO.iter().copied().collect(),
+            "image" => IMAGE.iter().copied().collect(),
+            "executable" => EXECUTABLE.iter().copied().collect(),
+            "compressed" => COMPRESSED.iter().copied().collect(),
+            "config" => CONFIG.iter().copied().collect(),
+            _ => return None,
+        };
+        Some(set)
+    }
+
+    pub fn category_allowed(category: Option<&str>, obj: &DiskObject) -> bool {
+        let category = match category {
+            None => return true,
+            Some("all") | Some("") => return true,
+            Some(c) => c.trim(),
+        };
+        if category.is_empty() {
+            return true;
+        }
+        match category {
+            "folder" => matches!(obj.kind, DiskObjectKind::Folder),
+            "other" => {
+                if matches!(obj.kind, DiskObjectKind::Folder) {
+                    return false;
+                }
+                let known = all_known_extensions();
+                match &obj.ext {
+                    None => true,
+                    Some(ext) => {
+                        let ext_lower = ext.trim().to_lowercase();
+                        !known.contains(ext_lower.as_str())
+                    }
+                }
+            }
+            _ => {
+                if matches!(obj.kind, DiskObjectKind::Folder) {
+                    return true;
+                }
+                let set = match extension_set(category) {
+                    Some(s) => s,
+                    None => return true,
+                };
+                obj.ext.as_ref().map(|e| {
+                    let ext_lower = e.trim().to_lowercase();
+                    set.contains(ext_lower.as_str())
+                }).unwrap_or(false)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 struct FolderSizesReady {
     folder_sizes: HashMap<String, u64>,
@@ -850,17 +938,19 @@ fn find_files(
     state: tauri::State<AppState>,
     query: String,
     extensions: Option<String>,
+    category: Option<String>,
     limit: Option<u32>,
     use_fuzzy: Option<bool>,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
-    find_files_in_memory(&state, query, extensions, limit, use_fuzzy, offset)
+    find_files_in_memory(&state, query, extensions, category, limit, use_fuzzy, offset)
 }
 
 fn find_files_in_memory(
     state: &tauri::State<AppState>,
     query: String,
     extensions: Option<String>,
+    category: Option<String>,
     limit: Option<u32>,
     use_fuzzy: Option<bool>,
     offset: Option<u32>,
@@ -920,26 +1010,39 @@ fn find_files_in_memory(
         }
     });
 
-    let (use_mask, allowed_indices, allowed_count) = match &extension_set {
-        None => (false, Vec::<bool>::new(), disk_entries.len()),
-        Some(set) => {
+    let (use_mask, allowed_indices, allowed_count) = if let Some(ref set) = extension_set {
+        let mut mask: Vec<bool> = Vec::with_capacity(disk_entries.len());
+        let mut count = 0usize;
+        for o in disk_entries {
+            let allowed = match o.kind {
+                DiskObjectKind::File => o
+                    .ext
+                    .as_ref()
+                    .map(|t| set.contains(t))
+                    .unwrap_or(false),
+                DiskObjectKind::Folder => true,
+            };
+            if allowed {
+                count += 1;
+            }
+            mask.push(allowed);
+        }
+        (true, mask, count)
+    } else {
+        let category_ref = category.as_deref();
+        if matches!(category_ref, Some(c) if !c.trim().is_empty() && c.trim() != "all") {
             let mut mask: Vec<bool> = Vec::with_capacity(disk_entries.len());
             let mut count = 0usize;
             for o in disk_entries {
-                let allowed = match o.kind {
-                    DiskObjectKind::File => o
-                        .ext
-                        .as_ref()
-                        .map(|t| set.contains(t))
-                        .unwrap_or(false),
-                    DiskObjectKind::Folder => true,
-                };
+                let allowed = category_filter::category_allowed(category_ref.map(|s| s.trim()), o);
                 if allowed {
                     count += 1;
                 }
                 mask.push(allowed);
             }
             (true, mask, count)
+        } else {
+            (false, Vec::new(), disk_entries.len())
         }
     };
 
@@ -947,8 +1050,8 @@ fn find_files_in_memory(
     write_debug_log(
         state,
         &format!(
-            "find_files after_ext_filter allowed_count={} total_entries={} has_ext_filter={} ext_filter_ms={}",
-            allowed_count, disk_entries.len(), extension_set.is_some(), ext_filter_ms
+            "find_files after_filter allowed_count={} total_entries={} use_extensions={} category={:?} ext_filter_ms={}",
+            allowed_count, disk_entries.len(), extension_set.is_some(), category.as_deref(), ext_filter_ms
         ),
     );
 

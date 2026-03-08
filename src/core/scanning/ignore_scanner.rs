@@ -8,6 +8,40 @@ use ignore::WalkBuilder;
 use crate::{FileEntry, ScanProgress};
 use crate::core::scanning::utils::{PROGRESS_INTERVAL, file_key_from_path};
 
+const NODE_MODULES: &str = "node_modules";
+const VENV_DIR: &str = ".venv";
+
+// TODOdin: are we sure we want to ignore these?
+// They're at least relevant for the space-cleaning part of this app
+fn is_dependencies_dir(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| n == NODE_MODULES || n == VENV_DIR)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn is_virtual_fs(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    let s = path_str.as_ref();
+    s == "/proc"
+        || s == "/sys"
+        || s == "/dev"
+        || s == "/run"
+        || s.starts_with("/proc/")
+        || s.starts_with("/sys/")
+        || s.starts_with("/dev/")
+        || s.starts_with("/run/")
+        || s == "/Network"
+        || s.starts_with("/Network/")
+        || s == "/net"
+        || s.starts_with("/net/")
+}
+
+#[cfg(not(unix))]
+fn is_virtual_fs(_path: &Path) -> bool {
+    false
+}
+
 pub fn index_directory_ignore_with_progress<F>(
     root: &Path,
     progress: F,
@@ -62,6 +96,9 @@ where
                 return WalkState::Continue;
             }
             if ft.is_dir() {
+                if is_virtual_fs(entry.path()) || is_dependencies_dir(entry.path()) {
+                    return WalkState::Skip;
+                }
                 if let Ok(mut guard) = folders_acc.lock() {
                     guard.insert(entry.path().to_path_buf());
                 }

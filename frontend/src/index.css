@@ -1,1 +1,149 @@
+@import url("https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=Fredoka:wght@400;500;600;700&display=swap");
 @import "tailwindcss";
+@config "../../tailwind.config.js";
+
+@source inline(
+  "bg-sky/50 text-accent-foreground",
+  "bg-peach/50 text-foreground",
+  "bg-lavender/50 text-secondary-foreground",
+  "bg-rose/50 text-foreground",
+  "bg-mint/50 text-accent-foreground",
+  "bg-cream/50 text-foreground",
+  "bg-muted text-muted-foreground",
+  "bg-sky text-foreground shadow-cozy",
+  "bg-peach text-foreground shadow-cozy",
+  "bg-lavender text-foreground shadow-cozy",
+  "bg-rose text-foreground shadow-cozy",
+  "bg-cream text-foreground shadow-cozy",
+  "bg-mint text-foreground shadow-cozy",
+  "bg-muted text-foreground shadow-cozy",
+  "hover:bg-muted/50 hover:text-foreground"
+);
+
+@layer base {
+    * {
+        border-color: hsl(var(--border));
+    }
+
+    body {
+        font-family: "Nunito", ui-sans-serif, system-ui, sans-serif;
+        font-feature-settings: "rlig" 1, "calt" 1;
+    }
+
+    h1, h2, h3, h4, h5, h6 {
+        font-family: "Fredoka", sans-serif;
+    }
+
+    :root {
+        --background: 30 50% 97%;
+        --foreground: 280 20% 25%;
+
+        --card: 30 40% 98%;
+        --card-foreground: 280 20% 25%;
+
+        --popover: 30 40% 98%;
+        --popover-foreground: 280 20% 25%;
+
+        --primary: 340 60% 65%;
+        --primary-foreground: 0 0% 100%;
+
+        --secondary: 260 40% 85%;
+        --secondary-foreground: 260 30% 30%;
+
+        --muted: 30 30% 93%;
+        --muted-foreground: 280 10% 50%;
+
+        --accent: 160 40% 80%;
+        --accent-foreground: 160 30% 25%;
+
+        --destructive: 0 60% 65%;
+        --destructive-foreground: 0 0% 100%;
+
+        --border: 280 20% 88%;
+        --input: 280 15% 90%;
+        --ring: 340 50% 70%;
+
+        --radius: 1rem;
+
+        --peach: 20 80% 85%;
+        --lavender: 270 50% 85%;
+        --mint: 160 40% 82%;
+        --cream: 40 60% 94%;
+        --rose: 340 60% 80%;
+        --sky: 200 50% 85%;
+
+        --sidebar-background: 0 0% 98%;
+        --sidebar-foreground: 240 5.3% 26.1%;
+        --sidebar-primary: 240 5.9% 10%;
+        --sidebar-primary-foreground: 0 0% 98%;
+        --sidebar-accent: 240 4.8% 95.9%;
+        --sidebar-accent-foreground: 240 5.9% 10%;
+        --sidebar-border: 220 13% 91%;
+        --sidebar-ring: 217.2 91.2% 59.8%;
+    }
+}
+
+@layer utilities {
+    .glass {
+        background-color: hsl(var(--card) / 0.7);
+        backdrop-filter: blur(24px);
+        border: 1px solid hsl(var(--border) / 0.5);
+        box-shadow:
+            0 4px 20px -4px hsl(var(--primary) / 0.12),
+            0 2px 8px -2px hsl(var(--lavender) / 0.15);
+    }
+    .glass-strong {
+        background-color: hsl(var(--card) / 0.85);
+        backdrop-filter: blur(40px);
+        border: 1px solid hsl(var(--border) / 0.6);
+        box-shadow:
+            0 8px 40px -8px hsl(var(--primary) / 0.15),
+            0 4px 16px -4px hsl(var(--lavender) / 0.2);
+    }
+}
+
+@keyframes float {
+    0%,
+    100% {
+        transform: translateY(0px) rotate(0deg);
+    }
+    33% {
+        transform: translateY(-8px) rotate(1deg);
+    }
+    66% {
+        transform: translateY(4px) rotate(-1deg);
+    }
+}
+
+@keyframes gentle-bounce {
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+    50% {
+        transform: translateY(-4px);
+    }
+}
+
+.cozy-file-finding ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+.cozy-file-finding ::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.cozy-file-finding ::-webkit-scrollbar-thumb {
+    background-color: hsl(280 20% 35%);
+    border-radius: 999px;
+}
+
+.cozy-file-finding ::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(280 20% 25%);
+}
+
+.cozy-file-finding {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(280 20% 35%) transparent;
+}

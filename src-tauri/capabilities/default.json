@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default capabilities for the app",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "updater:default", "process:default"]
+  "permissions": ["core:default", "dialog:default", "updater:default", "process:default", "opener:allow-open-path", "opener:allow-reveal-item-in-dir"]
 }

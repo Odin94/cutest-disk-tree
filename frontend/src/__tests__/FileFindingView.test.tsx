@@ -13,10 +13,8 @@ vi.mock("../api", () => ({
 
 const makeScan = (): ScanResult => ({
   roots: ["C:\\data"],
-  files: [
-    { path: "C:\\data\\a.txt", size: 100, file_key: { dev: 1, ino: 1 } },
-    { path: "C:\\data\\b.txt", size: 200, file_key: { dev: 1, ino: 2 } },
-  ],
+  files: [],
+  files_count: 300,
   folder_sizes: {
     "C:\\data": 300,
   },
@@ -112,29 +110,21 @@ describe("FileFindingView", () => {
 
   it("renders summary with scanned roots when result is provided", () => {
     render(<FileFindingView {...defaultProps} result={makeScan()} />);
-    expect(screen.getByText("C:\\data")).toBeInTheDocument();
+    expect(screen.getByText("300")).toBeInTheDocument();
+    expect(screen.getByText("files indexed")).toBeInTheDocument();
   });
 
   it("shows tabs when result is loaded", () => {
-    const { container } = render(
-      <FileFindingView {...defaultProps} result={makeScan()} />
-    );
-    const tabs = container.querySelectorAll(".tabs .tab");
-    const tabNames = Array.from(tabs).map((t) => t.textContent);
-    expect(tabNames).toContain("Find files");
-    expect(tabNames).toContain("Largest folders");
+    render(<FileFindingView {...defaultProps} result={makeScan()} />);
+    expect(screen.getByRole("button", { name: /find files/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /largest folders/i })).toBeInTheDocument();
   });
 
   it("switches to folders tab and shows folder list", async () => {
     const user = userEvent.setup();
-    const { container } = render(
-      <FileFindingView {...defaultProps} result={makeScan()} />
-    );
-    const foldersTab = Array.from(
-      container.querySelectorAll(".tabs .tab")
-    ).find((t) => t.textContent === "Largest folders")!;
+    render(<FileFindingView {...defaultProps} result={makeScan()} />);
+    const foldersTab = screen.getByRole("button", { name: /largest folders/i });
     await user.click(foldersTab);
-    const folderItems = container.querySelectorAll(".folder-list .list-item");
-    expect(folderItems.length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("C:\\data")).toBeInTheDocument();
   });
 });

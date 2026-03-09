@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { Toaster } from "sonner";
 import { scanDirectory, onScanProgress, loadCachedScan, debugLog, onScanPhaseStatus, onScanFolderSizesReady } from "./api";
 import type { ScanResult, ScanProgress, FolderSizesReady, ScanDirectoryResponse } from "./types";
 import "./App.css";
@@ -6,50 +7,6 @@ import { DiskUsageView } from "./views/DiskUsageView";
 import { FileFindingView } from "./views/FileFindingView";
 
 type CategoryId = "disk" | "find";
-
-const CheckForUpdatesButton = () => {
-  const [checking, setChecking] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-
-  const check = async () => {
-    debugLog("App click Check for updates");
-    setChecking(true);
-    setMessage(null);
-    try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check();
-      if (update != null) {
-        setMessage(`Update ${update.version} available. Downloading…`);
-        const { relaunch } = await import("@tauri-apps/plugin-process");
-        await update.downloadAndInstall();
-        setMessage("Update installed. Restarting…");
-        await relaunch();
-      } else {
-        setMessage("No updates available.");
-      }
-    } catch (e) {
-      setMessage(e instanceof Error ? e.message : String(e));
-    } finally {
-      setChecking(false);
-    }
-  };
-
-  return (
-    <span className="updater-wrap">
-      <button
-        type="button"
-        className="secondary"
-        onClick={check}
-        disabled={checking}
-      >
-        {checking ? "Checking…" : "Check for updates"}
-      </button>
-      {message != null ? (
-        <span className="updater-message">{message}</span>
-      ) : null}
-    </span>
-  );
-};
 
 const App = () => {
   const [category, setCategory] = useState<CategoryId>("find");
@@ -211,19 +168,7 @@ const App = () => {
     <div
       className={`app ${category === "disk" ? "app-dashboard-layout" : ""}`}
     >
-      <header className="header">
-        <h1>Cutest Disk Tree</h1>
-        <div className="header-actions">
-          {scanPhaseStatus !== "" ? (
-            <div className="scan-phase-indicator">
-              <span className="scan-phase-spinner" />
-              <span className="scan-phase-label">{scanPhaseStatus}</span>
-            </div>
-          ) : null}
-          <CheckForUpdatesButton />
-        </div>
-      </header>
-
+      <Toaster />
       <nav className="nav-categories">
         <button
           type="button"
@@ -268,6 +213,7 @@ const App = () => {
             loading={loading}
             error={error}
             progress={progress}
+            scanPhaseStatus={scanPhaseStatus}
             onScan={runScan}
             onCancelScan={cancelScan}
           />

@@ -60,7 +60,7 @@ pub struct ScanResult {
     pub folder_sizes: HashMap<String, u64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct ScanSummary {
     pub roots: Vec<String>,
     pub files_count: u64,

@@ -1,4 +1,8 @@
 use cutest_disk_tree::{db, DiskObject, DiskObjectKind};
+use cutest_disk_tree::core::indexing::compressed_text_index::{
+    write_compressed_text_index, search_compressed_text_index, compressed_text_index_exists,
+    write_scan_metadata, read_scan_metadata, read_scan_result_from_compressed_text_index,
+};
 use cutest_disk_tree::core::indexing::suffix::{SuffixIndex, build_suffix_index, search_suffix_index};
 use cutest_disk_tree::core::indexing::sqlite::{search_disk_objects_by_name, SearchFilter};
 use cutest_disk_tree::core::search_category;
@@ -200,6 +204,28 @@ mod tests;
 #[cfg(test)]
 mod search_tests;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchIndexMode {
+    Sqlite,
+    InMemorySuffix,
+    InMemoryNgrams,
+    CompressedText,
+}
+
+fn parse_index_mode() -> SearchIndexMode {
+    match std::env::var("CUTE_DISK_TREE_INDEX_MODE").as_deref() {
+        Ok("sqlite") => SearchIndexMode::Sqlite,
+        Ok("in-memory-suffix") => SearchIndexMode::InMemorySuffix,
+        Ok("in-memory-ngrams") => SearchIndexMode::InMemoryNgrams,
+        Ok("compressed-text") => SearchIndexMode::CompressedText,
+        _ => SearchIndexMode::CompressedText,
+    }
+}
+
+fn uses_in_memory_index(mode: SearchIndexMode) -> bool {
+    matches!(mode, SearchIndexMode::InMemorySuffix | SearchIndexMode::InMemoryNgrams)
+}
+
 struct AppState {
     db_path: std::path::PathBuf,
     debug_log: Mutex<Option<std::path::PathBuf>>,
@@ -208,6 +234,7 @@ struct AppState {
     phase2_cancel: Mutex<Arc<AtomicBool>>,
     is_scanning: AtomicBool,
     scan_path_override: Option<String>,
+    index_mode: SearchIndexMode,
 }
 
 fn resolve_debug_log_path(state: &AppState) -> std::path::PathBuf {
@@ -427,21 +454,25 @@ fn run_phase2(
     files_bg: Arc<Vec<cutest_disk_tree::FileEntry>>,
     folder_paths: std::collections::HashSet<std::path::PathBuf>,
     cancel: Arc<AtomicBool>,
+    mode: SearchIndexMode,
 ) {
     let state_ptr: tauri::State<AppState> = app_bg.state();
     let total_start = Instant::now();
 
     write_debug_log(&state_ptr, &format!(
-        "phase2 starting files={} folders={} roots={:?}",
-        files_bg.len(), folder_paths.len(), scan_roots,
+        "phase2 starting mode={:?} files={} folders={} roots={:?}",
+        mode, files_bg.len(), folder_paths.len(), scan_roots,
     ));
 
-    activate_initial_index(&app_bg, &state_ptr, &files_bg, &folder_paths, &cancel);
-
-    if cancel.load(Ordering::Relaxed) {
-        write_debug_log(&state_ptr, "phase2 cancelled after index build");
-        let _ = app_bg.emit("scan-phase-status", "".to_string());
-        return;
+    if uses_in_memory_index(mode) {
+        activate_initial_index(&app_bg, &state_ptr, &files_bg, &folder_paths, &cancel);
+        if cancel.load(Ordering::Relaxed) {
+            write_debug_log(&state_ptr, "phase2 cancelled after index build");
+            let _ = app_bg.emit("scan-phase-status", "".to_string());
+            return;
+        }
+    } else {
+        let _ = app_bg.emit("scan-index-ready", true);
     }
 
     write_debug_log(&state_ptr, "phase2 computing folder sizes");
@@ -466,25 +497,25 @@ fn run_phase2(
         return;
     }
 
-    write_debug_log(&state_ptr, "phase2 applying folder sizes to index");
-    let _ = app_bg.emit("scan-phase-status", "updating search index with sizes...".to_string());
-    let existing_arc = {
-        let guard = state_ptr.disk_objects.lock().unwrap();
-        guard.clone()
-    };
-    if let Some(arc) = existing_arc {
-        let apply_start = Instant::now();
-        let new_objs = apply_folder_sizes((*arc).clone(), &folder_sizes);
-        let apply_ms = apply_start.elapsed().as_millis();
-
-        write_debug_log(&state_ptr, &format!(
-            "phase2 index_updated objects={} apply_folder_sizes_ms={} total_ms={}",
-            new_objs.len(), apply_ms, total_start.elapsed().as_millis(),
-        ));
-
-        {
-            let mut disk_guard = state_ptr.disk_objects.lock().unwrap();
-            *disk_guard = Some(Arc::new(new_objs));
+    if uses_in_memory_index(mode) {
+        write_debug_log(&state_ptr, "phase2 applying folder sizes to index");
+        let _ = app_bg.emit("scan-phase-status", "updating search index with sizes...".to_string());
+        let existing_arc = {
+            let guard = state_ptr.disk_objects.lock().unwrap();
+            guard.clone()
+        };
+        if let Some(arc) = existing_arc {
+            let apply_start = Instant::now();
+            let new_objs = apply_folder_sizes((*arc).clone(), &folder_sizes);
+            let apply_ms = apply_start.elapsed().as_millis();
+            write_debug_log(&state_ptr, &format!(
+                "phase2 index_updated objects={} apply_folder_sizes_ms={} total_ms={}",
+                new_objs.len(), apply_ms, total_start.elapsed().as_millis(),
+            ));
+            {
+                let mut disk_guard = state_ptr.disk_objects.lock().unwrap();
+                *disk_guard = Some(Arc::new(new_objs));
+            }
         }
     }
 
@@ -503,74 +534,58 @@ fn run_phase2(
         return;
     }
 
-    write_debug_log(&state_ptr, "phase2 opening database");
-    let _ = app_bg.emit("scan-phase-status", "saving to database...".to_string());
-    let update_id = chrono::Utc::now().timestamp_millis();
-    let db_open_start = Instant::now();
-    let conn = match db::open_db(&db_path_bg) {
-        Ok(c) => c,
-        Err(e) => {
-            write_debug_log(&state_ptr, &format!(
-                "phase2 db_open_failed error={} total_ms={}",
-                e, total_start.elapsed().as_millis(),
-            ));
-            let _ = app_bg.emit("scan-phase-status", "".to_string());
-            return;
+    let roots_str: Vec<String> = scan_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+
+    if mode == SearchIndexMode::CompressedText {
+        let app_data_dir = db_path_bg.parent().unwrap_or(&db_path_bg);
+        let cti_path = app_data_dir.join("index.compressed-text-index.lz4");
+        let metadata_path = app_data_dir.join("scan-metadata.json");
+        write_debug_log(&state_ptr, "phase2 writing compressed text index");
+        let _ = app_bg.emit("scan-phase-status", "writing search index...".to_string());
+        match write_compressed_text_index(&cti_path, &files_bg, &folder_sizes) {
+            Ok(()) => write_debug_log(&state_ptr, &format!("phase2 cti_write done path={}", cti_path.display())),
+            Err(e) => write_debug_log(&state_ptr, &format!("phase2 cti_write failed error={:?}", e)),
         }
-    };
-    let db_open_ms = db_open_start.elapsed().as_millis();
-    write_debug_log(&state_ptr, &format!("phase2 db_open done ms={}", db_open_ms));
-
-    write_debug_log(&state_ptr, "phase2 writing scan data to db");
-    let _ = app_bg.emit("scan-phase-status", "writing scan data to database...".to_string());
-    let db_write_start = Instant::now();
-    let write_result = db::write_scan(&conn, &files_bg, &folder_sizes, update_id);
-    let db_write_ms = db_write_start.elapsed().as_millis();
-    write_debug_log(&state_ptr, &format!(
-        "phase2 db_write done ok={} ms={}",
-        write_result.is_ok(), db_write_ms,
-    ));
-
-    write_debug_log(&state_ptr, "phase2 writing suffix index to db");
-    let _ = app_bg.emit("scan-phase-status", "writing search index to database...".to_string());
-    let index_write_ms = if write_result.is_ok() {
-        let index_arc = {
-            let guard = state_ptr.name_reverse_index.lock().unwrap();
-            guard.clone()
-        };
-        if let Some(arc) = index_arc {
-            let idx_start = Instant::now();
-            let _ = db::write_suffix_index_data(
-                &conn, update_id,
-                &arc.buffer, &arc.offsets, &arc.disk_object_indices,
-            );
-            let ms = idx_start.elapsed().as_millis();
-            write_debug_log(&state_ptr, &format!("phase2 suffix_index_write done ms={}", ms));
-            ms
-        } else {
-            write_debug_log(&state_ptr, "phase2 no suffix index to write");
-            0
+        if let Err(e) = write_scan_metadata(&metadata_path, &roots_str, files_bg.len() as u64, &folder_sizes) {
+            write_debug_log(&state_ptr, &format!("phase2 scan_metadata write failed error={:?}", e));
+        }
+    } else if mode == SearchIndexMode::Sqlite {
+        write_debug_log(&state_ptr, "phase2 opening database");
+        let _ = app_bg.emit("scan-phase-status", "saving to database...".to_string());
+        let update_id = chrono::Utc::now().timestamp_millis();
+        match db::open_db(&db_path_bg) {
+            Ok(conn) => {
+                if let Err(e) = db::write_scan(&conn, &files_bg, &folder_sizes, update_id) {
+                    write_debug_log(&state_ptr, &format!("phase2 db_write failed error={:?}", e));
+                } else {
+                    write_debug_log(&state_ptr, "phase2 db_write done");
+                }
+            }
+            Err(e) => write_debug_log(&state_ptr, &format!("phase2 db_open failed error={:?}", e)),
         }
     } else {
-        0
-    };
-
-    let total_ms = total_start.elapsed().as_millis();
-
-    match write_result {
-        Ok(()) => {
-            write_debug_log(&state_ptr, &format!(
-                "phase2 done files={} folders={} sizes_ms={} db_open_ms={} db_write_ms={} index_write_ms={} total_ms={}",
-                files_bg.len(), folder_sizes.len(), sizes_ms, db_open_ms, db_write_ms, index_write_ms, total_ms,
-            ));
-        }
-        Err(e) => {
-            write_debug_log(&state_ptr, &format!(
-                "phase2 db_write_failed error={} sizes_ms={} db_open_ms={} db_write_ms={} total_ms={}",
-                e, sizes_ms, db_open_ms, db_write_ms, total_ms,
-            ));
+        write_debug_log(&state_ptr, "phase2 opening database");
+        let _ = app_bg.emit("scan-phase-status", "saving to database...".to_string());
+        let update_id = chrono::Utc::now().timestamp_millis();
+        match db::open_db(&db_path_bg) {
+            Ok(conn) => {
+                if let Err(e) = db::write_scan(&conn, &files_bg, &folder_sizes, update_id) {
+                    write_debug_log(&state_ptr, &format!("phase2 db_write failed error={:?}", e));
+                } else {
+                    let index_arc = { state_ptr.name_reverse_index.lock().unwrap().clone() };
+                    if let Some(arc) = index_arc {
+                        let _ = db::write_suffix_index_data(
+                            &conn, update_id,
+                            &arc.buffer, &arc.offsets, &arc.disk_object_indices,
+                        );
+                    }
+                    write_debug_log(&state_ptr, "phase2 db_write and suffix_index done");
+                }
+            }
+            Err(e) => write_debug_log(&state_ptr, &format!("phase2 db_open failed error={:?}", e)),
         }
     }
+
     let _ = app_bg.emit("scan-phase-status", "".to_string());
 }
 
@@ -661,8 +676,9 @@ async fn scan_directory(
     let files_bg = Arc::clone(&files_arc);
     let roots_bg = scan_roots;
     let folder_paths_bg = all_folder_paths;
+    let mode = state.index_mode;
     tauri::async_runtime::spawn_blocking(move || {
-        run_phase2(app_bg, db_path, roots_bg, files_bg, folder_paths_bg, cancel_token);
+        run_phase2(app_bg, db_path, roots_bg, files_bg, folder_paths_bg, cancel_token, mode);
     });
 
     state.is_scanning.store(false, Ordering::SeqCst);
@@ -676,52 +692,48 @@ async fn load_cached_scan(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<cutest_disk_tree::ScanSummary>, String> {
     let t0 = Instant::now();
-    write_debug_log(&state, "load_cached_scan started");
+    write_debug_log(&state, &format!("load_cached_scan started mode={:?}", state.index_mode));
     let db_path = state.db_path.clone();
-    let summary = match tauri::async_runtime::spawn_blocking({
-        let db_path = db_path.clone();
-        move || {
-            let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
-            let res = db::get_scan_summary(&conn).map_err(|e| e.to_string())?;
-            Ok::<_, String>(res)
+    let mode = state.index_mode;
+
+    let summary = match mode {
+        SearchIndexMode::CompressedText => {
+            let metadata_path = db_path.parent()
+                .map(|p| p.join("scan-metadata.json"))
+                .unwrap_or_else(|| std::path::PathBuf::from("scan-metadata.json"));
+            match tauri::async_runtime::spawn_blocking(move || {
+                read_scan_metadata(&metadata_path).map_err(|e| e.to_string())
+            }).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(e.to_string()),
+            }
         }
-    })
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            write_debug_log(&state, &format!("error load_cached_scan: {}", e));
-            return Err(e);
-        }
-        Err(e) => {
-            write_debug_log(&state, &format!("error load_cached_scan spawn: {}", e));
-            return Err(e.to_string());
+        SearchIndexMode::Sqlite | SearchIndexMode::InMemorySuffix | SearchIndexMode::InMemoryNgrams => {
+            match tauri::async_runtime::spawn_blocking({
+                let db_path = db_path.clone();
+                move || {
+                    let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
+                    db::get_scan_summary(&conn).map_err(|e| e.to_string())
+                }
+            }).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(e.to_string()),
+            }
         }
     };
-    let ms = t0.elapsed().as_millis();
-    write_debug_log(
-        &state,
-        &format!(
-            "load_cached_scan done has_result={} ms={}",
-            summary.is_some(),
-            ms
-        ),
-    );
 
-    if summary.is_some() {
+    let ms = t0.elapsed().as_millis();
+    write_debug_log(&state, &format!("load_cached_scan done has_result={} ms={}", summary.is_some(), ms));
+
+    if summary.is_some() && uses_in_memory_index(mode) {
         let app_bg = app.clone();
-        let state_ref: &AppState = &state;
-        let cancel = {
-            let guard = state_ref.phase2_cancel.lock().unwrap();
-            guard.clone()
-        };
+        let cancel = { state.phase2_cancel.lock().unwrap().clone() };
         write_debug_log(&state, "load_cached_scan: spawning background index build from DB");
         tauri::async_runtime::spawn_blocking(move || {
             let state_ptr: tauri::State<AppState> = app_bg.state();
-            let t0 = Instant::now();
             let _ = app_bg.emit("scan-phase-status", "loading files from database...".to_string());
-            write_debug_log(&state_ptr, "load_cached_scan: loading files from DB");
-
             let conn = match db::open_db(&db_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -732,23 +744,11 @@ async fn load_cached_scan(
             };
             let scan_result = match db::get_scan_result(&conn) {
                 Ok(Some(r)) => r,
-                Ok(None) => {
-                    write_debug_log(&state_ptr, "load_cached_scan: no scan data in DB");
-                    let _ = app_bg.emit("scan-phase-status", "".to_string());
-                    return;
-                }
-                Err(e) => {
-                    write_debug_log(&state_ptr, &format!("load_cached_scan: get_scan_result failed: {}", e));
+                Ok(None) | Err(_) => {
                     let _ = app_bg.emit("scan-phase-status", "".to_string());
                     return;
                 }
             };
-            let load_ms = t0.elapsed().as_millis();
-            write_debug_log(&state_ptr, &format!(
-                "load_cached_scan: loaded files={} from DB ms={}",
-                scan_result.files.len(), load_ms,
-            ));
-
             let files: Vec<cutest_disk_tree::FileEntry> = scan_result.files.iter().map(|f| {
                 cutest_disk_tree::FileEntry {
                     path: std::path::PathBuf::from(&f.path),
@@ -760,12 +760,8 @@ async fn load_cached_scan(
             let folder_paths: std::collections::HashSet<std::path::PathBuf> = scan_result.folder_sizes.keys()
                 .map(|p| std::path::PathBuf::from(p))
                 .collect();
-
             activate_initial_index(&app_bg, &state_ptr, &files, &folder_paths, &cancel);
-            write_debug_log(&state_ptr, &format!(
-                "load_cached_scan: index build done total_ms={}",
-                t0.elapsed().as_millis(),
-            ));
+            let _ = app_bg.emit("scan-phase-status", "".to_string());
         });
     }
 
@@ -777,6 +773,9 @@ async fn list_cached_tree_depths(
     state: tauri::State<'_, AppState>,
     max_children: u32,
 ) -> Result<Vec<u32>, String> {
+    if matches!(state.index_mode, SearchIndexMode::CompressedText) {
+        return Ok(Vec::new());
+    }
     let db_path = state.db_path.clone();
     let depths = match tauri::async_runtime::spawn_blocking(move || {
         let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
@@ -812,9 +811,32 @@ async fn build_disk_tree_cached(
     max_children_per_node: u32,
     max_depth: u32,
 ) -> Result<Option<cutest_disk_tree::DiskTreeNode>, String> {
-    write_debug_log(&state, &format!("build_disk_tree_cached started start_path={} max_depth={}", start_path, max_depth));
+    write_debug_log(&state, &format!("build_disk_tree_cached started mode={:?} start_path={} max_depth={}", state.index_mode, start_path, max_depth));
     let db_path = state.db_path.clone();
     let path_clone = start_path.clone();
+    let mode = state.index_mode;
+
+    if mode == SearchIndexMode::CompressedText {
+        let cti_path = state.db_path.parent()
+            .map(|p| p.join("index.compressed-text-index.lz4"))
+            .unwrap_or_else(|| std::path::PathBuf::from("index.compressed-text-index.lz4"));
+        let path_for_cti = path_clone.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            if !compressed_text_index_exists(&cti_path) {
+                return Ok(None);
+            }
+            let scan = read_scan_result_from_compressed_text_index(&cti_path)
+                .map_err(|e| format!("{:?}", e))?;
+            let tree = cutest_disk_tree::build_disk_tree(
+                &scan,
+                &path_for_cti,
+                max_children_per_node as usize,
+                max_depth as usize,
+            );
+            Ok(tree)
+        }).await.map_err(|e| e.to_string())?;
+    }
+
     let result = match tauri::async_runtime::spawn_blocking(move || {
         let total_start = Instant::now();
 
@@ -931,7 +953,14 @@ async fn build_disk_tree_cached(
             return Err(e.to_string());
         }
     };
+
     Ok(result)
+}
+
+fn resolve_compressed_text_index_path(state: &AppState) -> std::path::PathBuf {
+    state.db_path.parent()
+        .map(|p| p.join("index.compressed-text-index.lz4"))
+        .unwrap_or_else(|| std::path::PathBuf::from("index.compressed-text-index.lz4"))
 }
 
 #[tauri::command]
@@ -944,7 +973,18 @@ fn find_files(
     use_fuzzy: Option<bool>,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
-    find_files_in_db(&state, query, extensions, category, limit, use_fuzzy, offset)
+    match state.index_mode {
+        SearchIndexMode::CompressedText => find_files_in_compressed_text_index(&state, query, extensions, category, limit, use_fuzzy, offset),
+        SearchIndexMode::Sqlite => find_files_in_db(&state, query, extensions, category, limit, use_fuzzy, offset),
+        SearchIndexMode::InMemorySuffix | SearchIndexMode::InMemoryNgrams => {
+            let has_memory_index = state.disk_objects.lock().unwrap().is_some();
+            if has_memory_index {
+                find_files_in_memory(&state, query, extensions, category, limit, use_fuzzy, offset)
+            } else {
+                find_files_in_db(&state, query, extensions, category, limit, use_fuzzy, offset)
+            }
+        }
+    }
 }
 
 fn find_files_in_memory(
@@ -1203,6 +1243,61 @@ fn find_files_in_memory(
     }
 }
 
+fn find_files_in_compressed_text_index(
+    state: &tauri::State<AppState>,
+    query: String,
+    extensions: Option<String>,
+    category: Option<String>,
+    limit: Option<u32>,
+    _use_fuzzy: Option<bool>,
+    offset: Option<u32>,
+) -> Result<FindFilesResponse, String> {
+    const DEFAULT_LIMIT: u32 = 500;
+    let limit = limit.unwrap_or(DEFAULT_LIMIT) as usize;
+    let offset = offset.unwrap_or(0) as usize;
+    let total_start = Instant::now();
+
+    write_debug_log(
+        state,
+        &format!(
+            ">>> find_files_in_compressed_text_index start query_len={} limit={} offset={}",
+            query.len(), limit, offset
+        ),
+    );
+
+    let cti_path = resolve_compressed_text_index_path(state);
+    let filter = resolve_search_filter(extensions.as_deref(), category.as_deref());
+
+    let (disk_entries, has_more, timings) = search_compressed_text_index(
+        &cti_path,
+        &query,
+        &filter,
+        limit,
+        offset,
+    ).map_err(|e| format!("compressed text index search failed: {:?}", e))?;
+
+    let items: Vec<SearchEntry> = disk_entries
+        .iter()
+        .map(|o| search_entry_from_disk_object(o))
+        .collect();
+
+    let next_offset = if has_more { Some(offset + limit) } else { None };
+    let total_ms = total_start.elapsed().as_millis();
+
+    write_debug_log(
+        state,
+        &format!(
+            "find_files_in_compressed_text_index done open_ms={} scan_ms={} total_ms={} count={} next_offset={:?}",
+            timings.open_ms, timings.scan_ms, total_ms, items.len(), next_offset
+        ),
+    );
+
+    Ok(FindFilesResponse {
+        items,
+        next_offset,
+    })
+}
+
 fn resolve_search_filter(
     extensions: Option<&str>,
     category: Option<&str>,
@@ -1366,7 +1461,11 @@ pub fn run() {
             let path = app.path().app_data_dir().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
             let db_path = path.join("index.db");
-            db::open_db(&db_path).map_err(|e| e.to_string())?;
+            let index_mode = parse_index_mode();
+
+            if !matches!(index_mode, SearchIndexMode::CompressedText) {
+                db::open_db(&db_path).map_err(|e| e.to_string())?;
+            }
 
             let env_log_path = std::env::var("CUTE_DISK_TREE_DEBUG_LOG_PATH").ok();
             let debug_log_path = env_log_path
@@ -1391,11 +1490,12 @@ pub fn run() {
                 .and_then(|mut f| {
                     use std::io::Write;
                     writeln!(f, "Loaded config from environment:")?;
-                    if let Ok(path) = std::env::var("CUTE_DISK_TREE_DEBUG_LOG_PATH") {
-                        writeln!(f, "CUTE_DISK_TREE_DEBUG_LOG_PATH={}", path)?;
+                    writeln!(f, "CUTE_DISK_TREE_INDEX_MODE={:?}", index_mode)?;
+                    if let Ok(p) = std::env::var("CUTE_DISK_TREE_DEBUG_LOG_PATH") {
+                        writeln!(f, "CUTE_DISK_TREE_DEBUG_LOG_PATH={}", p)?;
                     }
-                    if let Ok(path) = std::env::var("CUTE_DISK_TREE_SCAN_PATH") {
-                        writeln!(f, "CUTE_DISK_TREE_SCAN_PATH={}", path)?;
+                    if let Ok(p) = std::env::var("CUTE_DISK_TREE_SCAN_PATH") {
+                        writeln!(f, "CUTE_DISK_TREE_SCAN_PATH={}", p)?;
                     }
                     writeln!(f)?;
                     f.flush()
@@ -1406,7 +1506,7 @@ pub fn run() {
             let mut initial_disk_objects: Option<Arc<Vec<DiskObject>>> = None;
             let mut initial_name_index: Option<Arc<SuffixIndex>> = None;
 
-            if !force_fresh {
+            if !force_fresh && uses_in_memory_index(index_mode) {
                 let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
                 if db::has_disk_objects(&conn).unwrap_or(false) {
                     let mut objs = db::get_disk_objects(&conn).unwrap_or_default();
@@ -1462,6 +1562,7 @@ pub fn run() {
                 phase2_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
                 is_scanning: AtomicBool::new(false),
                 scan_path_override: scan_path_override.clone(),
+                index_mode,
             });
 
             if force_fresh {

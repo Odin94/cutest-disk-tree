@@ -17,6 +17,7 @@ ignore = "0.4"
 lz4_flex = "0.12"
 suffix = "1"
 chrono = "0.4"
+dotenvy = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 win-file-id = "0.1"
@@ -25,6 +26,10 @@ usn-journal-rs = "0.4"
 [[bin]]
 name = "cutest-disk-tree"
 path = "src/main.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
 
 [dev-dependencies]
 tempfile = "3"

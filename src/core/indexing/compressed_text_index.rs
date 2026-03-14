@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
@@ -26,6 +26,83 @@ pub fn find_files(
 ) -> CompressedTextIndexResult<(Vec<DiskObject>, bool)> {
     let (results, has_more, _) = search_compressed_text_index(index_path, query, filter, limit, offset)?;
     Ok((results, has_more))
+}
+
+/// A fully decompressed CTI held in RAM.  Built once via [`build_in_memory_index`]; searched
+/// with zero disk I/O via [`find_files_in_memory`].
+pub struct InMemoryIndex {
+    content: Box<[u8]>,
+}
+
+impl InMemoryIndex {
+    /// Total bytes of decompressed path data held in RAM.
+    pub fn size_bytes(&self) -> usize {
+        self.content.len()
+    }
+}
+
+/// Decompress all CTI shards at `index_path` into a single in-memory buffer.
+pub fn build_in_memory_index(index_path: &Path) -> CompressedTextIndexResult<InMemoryIndex> {
+    let shard_paths = resolve_shard_paths(index_path);
+    let mut content: Vec<u8> = Vec::new();
+    for shard_path in &shard_paths {
+        let file = File::open(shard_path)?;
+        let mut decoder = FrameDecoder::new(file);
+        decoder.read_to_end(&mut content)?;
+    }
+    Ok(InMemoryIndex { content: content.into_boxed_slice() })
+}
+
+/// Search an [`InMemoryIndex`] with zero disk I/O.
+///
+/// Scans the decompressed byte buffer line-by-line; matches against the basename of each entry.
+/// Results are sorted by path before pagination (the buffer is already sorted, but we need to
+/// sort after filtering so offsets are stable across shards loaded in sequence).
+pub fn find_files_in_memory(
+    index: &InMemoryIndex,
+    query: &str,
+    _filter: &SearchFilter,
+    limit: usize,
+    offset: usize,
+) -> CompressedTextIndexResult<(Vec<DiskObject>, bool)> {
+    let query_lower = query.to_ascii_lowercase();
+    let query_is_empty = query_lower.is_empty();
+    let global_needed = limit.saturating_add(offset).saturating_add(1);
+
+    let content = &index.content;
+    let mut results: Vec<DiskObject> = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < content.len() {
+        let end = content[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(content.len(), |i| pos + i);
+
+        if end > pos {
+            if let Ok(line) = std::str::from_utf8(&content[pos..end]) {
+                if let Some(path) = parse_path_line(line) {
+                    let name = basename(path);
+                    if query_is_empty || ascii_case_insensitive_contains(name, &query_lower) {
+                        results.push(build_disk_object_from_path(path));
+                        if results.len() >= global_needed {
+                            pos = end + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        pos = end + 1;
+    }
+
+    let has_more = results.len() >= global_needed;
+    // Buffer entries are already sorted, but sort here for correctness (consistent with the
+    // disk-based path which merges across shards).
+    results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    let s = offset.min(results.len());
+    let e = (s + limit).min(results.len());
+    Ok((results[s..e].to_vec(), has_more))
 }
 
 const KIND_FILE: u8 = b'f';

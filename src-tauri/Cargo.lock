@@ -681,6 +681,7 @@ name = "cutest-disk-tree"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dotenvy",
  "ignore",
  "jwalk",
  "lz4_flex",

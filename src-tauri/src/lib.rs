@@ -4,6 +4,9 @@ use cutest_disk_tree::core::indexing::compressed_text_index::{
     compressed_text_index_exists, write_scan_metadata, read_scan_metadata,
     read_scan_result_from_compressed_text_index,
 };
+use cutest_disk_tree::core::indexing::ngram::{
+    build_index as trigram_build_index, find_files as trigram_find_files, TrigramIndex,
+};
 use cutest_disk_tree::core::indexing::suffix::{
     SuffixIndex, build_index as suffix_build_index, find_files as suffix_find_files,
 };
@@ -221,7 +224,7 @@ fn parse_index_mode() -> SearchIndexMode {
         Ok("in-memory-suffix") => SearchIndexMode::InMemorySuffix,
         Ok("in-memory-ngrams") => SearchIndexMode::InMemoryNgrams,
         Ok("compressed-text") => SearchIndexMode::CompressedText,
-        _ => SearchIndexMode::CompressedText,
+        _ => SearchIndexMode::InMemoryNgrams,
     }
 }
 
@@ -234,6 +237,7 @@ struct AppState {
     debug_log: Mutex<Option<std::path::PathBuf>>,
     disk_objects: Mutex<Option<Arc<Vec<DiskObject>>>>,
     name_reverse_index: Mutex<Option<Arc<SuffixIndex>>>,
+    trigram_index: Mutex<Option<Arc<TrigramIndex>>>,
     phase2_cancel: Mutex<Arc<AtomicBool>>,
     is_scanning: AtomicBool,
     scan_path_override: Option<String>,
@@ -395,12 +399,13 @@ fn activate_initial_index(
     files: &[cutest_disk_tree::FileEntry],
     folder_paths: &std::collections::HashSet<std::path::PathBuf>,
     cancel: &AtomicBool,
+    mode: SearchIndexMode,
 ) {
     let t0 = Instant::now();
 
     write_debug_log(state, &format!(
-        "activate_initial_index starting files={} folders={}",
-        files.len(), folder_paths.len(),
+        "activate_initial_index starting mode={:?} files={} folders={}",
+        mode, files.len(), folder_paths.len(),
     ));
     let _ = app.emit("scan-phase-status", "building disk objects...".to_string());
 
@@ -419,32 +424,62 @@ fn activate_initial_index(
         return;
     }
 
-    let _ = app.emit("scan-phase-status", "building suffix index...".to_string());
-    write_debug_log(state, "activate_initial_index building suffix index");
-    let index = suffix_build_index(&objs);
-    write_debug_log(state, &format!(
-        "activate_initial_index build_index done total_ms={}",
-        t0.elapsed().as_millis(),
-    ));
+    match mode {
+        SearchIndexMode::InMemoryNgrams => {
+            let _ = app.emit("scan-phase-status", "building trigram index...".to_string());
+            write_debug_log(state, "activate_initial_index building trigram index");
+            let idx_start = Instant::now();
+            let index = trigram_build_index(&objs);
+            let idx_ms = idx_start.elapsed().as_millis();
+            write_debug_log(state, &format!(
+                "activate_initial_index trigram_build done idx_ms={} total_ms={}",
+                idx_ms, t0.elapsed().as_millis(),
+            ));
 
-    if cancel.load(Ordering::Relaxed) {
-        write_debug_log(state, &format!(
-            "activate_initial_index cancelled after build_index ms={}", t0.elapsed().as_millis(),
-        ));
-        return;
+            if cancel.load(Ordering::Relaxed) {
+                write_debug_log(state, "activate_initial_index cancelled after trigram build");
+                return;
+            }
+
+            {
+                let mut disk_guard = state.disk_objects.lock().unwrap();
+                *disk_guard = Some(Arc::new(objs));
+                let mut idx_guard = state.trigram_index.lock().unwrap();
+                *idx_guard = Some(Arc::new(index));
+            }
+        }
+        _ => {
+            // InMemorySuffix
+            let _ = app.emit("scan-phase-status", "building suffix index...".to_string());
+            write_debug_log(state, "activate_initial_index building suffix index");
+            let idx_start = Instant::now();
+            let index = suffix_build_index(&objs);
+            let idx_ms = idx_start.elapsed().as_millis();
+            write_debug_log(state, &format!(
+                "activate_initial_index suffix_build done idx_ms={} total_ms={}",
+                idx_ms, t0.elapsed().as_millis(),
+            ));
+
+            if cancel.load(Ordering::Relaxed) {
+                write_debug_log(state, &format!(
+                    "activate_initial_index cancelled after suffix build ms={}", t0.elapsed().as_millis(),
+                ));
+                return;
+            }
+
+            {
+                let mut disk_guard = state.disk_objects.lock().unwrap();
+                *disk_guard = Some(Arc::new(objs));
+                let mut idx_guard = state.name_reverse_index.lock().unwrap();
+                *idx_guard = Some(Arc::new(index));
+            }
+        }
     }
 
     write_debug_log(state, &format!(
-        "activate_initial_index done files={} folders={} objects={} build_disk_objs_ms={} total_ms={}",
-        files.len(), folder_paths.len(), objs.len(), build_ms, t0.elapsed().as_millis(),
+        "activate_initial_index done mode={:?} files={} folders={} build_disk_objs_ms={} total_ms={}",
+        mode, files.len(), folder_paths.len(), build_ms, t0.elapsed().as_millis(),
     ));
-
-    {
-        let mut disk_guard = state.disk_objects.lock().unwrap();
-        *disk_guard = Some(Arc::new(objs));
-        let mut idx_guard = state.name_reverse_index.lock().unwrap();
-        *idx_guard = Some(Arc::new(index));
-    }
 
     let _ = app.emit("scan-phase-status", "".to_string());
     let _ = app.emit("scan-index-ready", true);
@@ -468,7 +503,7 @@ fn run_phase2(
     ));
 
     if uses_in_memory_index(mode) {
-        activate_initial_index(&app_bg, &state_ptr, &files_bg, &folder_paths, &cancel);
+        activate_initial_index(&app_bg, &state_ptr, &files_bg, &folder_paths, &cancel, mode);
         if cancel.load(Ordering::Relaxed) {
             write_debug_log(&state_ptr, "phase2 cancelled after index build");
             let _ = app_bg.emit("scan-phase-status", "".to_string());
@@ -512,12 +547,29 @@ fn run_phase2(
             let new_objs = apply_folder_sizes((*arc).clone(), &folder_sizes);
             let apply_ms = apply_start.elapsed().as_millis();
             write_debug_log(&state_ptr, &format!(
-                "phase2 index_updated objects={} apply_folder_sizes_ms={} total_ms={}",
+                "phase2 apply_folder_sizes done objects={} ms={} total_ms={}",
                 new_objs.len(), apply_ms, total_start.elapsed().as_millis(),
             ));
+            let new_objs_arc = Arc::new(new_objs);
             {
                 let mut disk_guard = state_ptr.disk_objects.lock().unwrap();
-                *disk_guard = Some(Arc::new(new_objs));
+                *disk_guard = Some(Arc::clone(&new_objs_arc));
+            }
+
+            // For ngrams, rebuild the trigram index so search results carry folder sizes.
+            if mode == SearchIndexMode::InMemoryNgrams {
+                let rebuild_start = Instant::now();
+                write_debug_log(&state_ptr, &format!(
+                    "phase2 rebuilding trigram index after folder_sizes objects={}",
+                    new_objs_arc.len(),
+                ));
+                let new_index = trigram_build_index(&new_objs_arc);
+                let rebuild_ms = rebuild_start.elapsed().as_millis();
+                write_debug_log(&state_ptr, &format!(
+                    "phase2 trigram_rebuild done ms={} total_ms={}",
+                    rebuild_ms, total_start.elapsed().as_millis(),
+                ));
+                *state_ptr.trigram_index.lock().unwrap() = Some(Arc::new(new_index));
             }
         }
     }
@@ -618,11 +670,15 @@ fn run_phase2(
         write_debug_log(&state_ptr, "phase2 opening database");
         let _ = app_bg.emit("scan-phase-status", "saving to database...".to_string());
         let update_id = chrono::Utc::now().timestamp_millis();
+        let db_start = Instant::now();
         match db::open_db(&db_path_bg) {
             Ok(conn) => {
                 if let Err(e) = db::write_scan(&conn, &files_bg, &folder_sizes, update_id) {
-                    write_debug_log(&state_ptr, &format!("phase2 db_write failed error={:?}", e));
-                } else {
+                    write_debug_log(&state_ptr, &format!(
+                        "phase2 db_write failed error={:?} ms={}", e, db_start.elapsed().as_millis()
+                    ));
+                } else if mode == SearchIndexMode::InMemorySuffix {
+                    // Persist suffix index so startup can reload it without rebuilding.
                     let index_arc = { state_ptr.name_reverse_index.lock().unwrap().clone() };
                     if let Some(arc) = index_arc {
                         let _ = db::write_suffix_index_data(
@@ -630,7 +686,14 @@ fn run_phase2(
                             &arc.buffer, &arc.offsets, &arc.disk_object_indices,
                         );
                     }
-                    write_debug_log(&state_ptr, "phase2 db_write and suffix_index done");
+                    write_debug_log(&state_ptr, &format!(
+                        "phase2 db_write and suffix_index done ms={}", db_start.elapsed().as_millis()
+                    ));
+                } else {
+                    // InMemoryNgrams: disk_objects persisted via write_scan; no suffix index needed.
+                    write_debug_log(&state_ptr, &format!(
+                        "phase2 db_write done (ngrams, no suffix_index) ms={}", db_start.elapsed().as_millis()
+                    ));
                 }
             }
             Err(e) => write_debug_log(&state_ptr, &format!("phase2 db_open failed error={:?}", e)),
@@ -716,6 +779,8 @@ async fn scan_directory(
         *disk_guard = None;
         let mut idx_guard = state.name_reverse_index.lock().unwrap();
         *idx_guard = None;
+        let mut tri_guard = state.trigram_index.lock().unwrap();
+        *tri_guard = None;
     }
     let response = ScanDirectoryResponse {
         roots: roots_str,
@@ -811,7 +876,7 @@ async fn load_cached_scan(
             let folder_paths: std::collections::HashSet<std::path::PathBuf> = scan_result.folder_sizes.keys()
                 .map(|p| std::path::PathBuf::from(p))
                 .collect();
-            activate_initial_index(&app_bg, &state_ptr, &files, &folder_paths, &cancel);
+            activate_initial_index(&app_bg, &state_ptr, &files, &folder_paths, &cancel, state_ptr.index_mode);
             let _ = app_bg.emit("scan-phase-status", "".to_string());
         });
     }
@@ -1027,7 +1092,15 @@ fn find_files(
     match state.index_mode {
         SearchIndexMode::CompressedText => find_files_in_compressed_text_index(&state, query, extensions, category, limit, use_fuzzy, offset),
         SearchIndexMode::Sqlite => find_files_in_db(&state, query, extensions, category, limit, use_fuzzy, offset),
-        SearchIndexMode::InMemorySuffix | SearchIndexMode::InMemoryNgrams => {
+        SearchIndexMode::InMemoryNgrams => {
+            let has_index = state.trigram_index.lock().unwrap().is_some();
+            if has_index {
+                find_files_in_ngram_index(&state, query, extensions, category, limit, use_fuzzy, offset)
+            } else {
+                find_files_in_db(&state, query, extensions, category, limit, use_fuzzy, offset)
+            }
+        }
+        SearchIndexMode::InMemorySuffix => {
             let has_memory_index = state.disk_objects.lock().unwrap().is_some();
             if has_memory_index {
                 find_files_in_memory(&state, query, extensions, category, limit, use_fuzzy, offset)
@@ -1294,6 +1367,111 @@ fn find_files_in_memory(
     }
 }
 
+fn find_files_in_ngram_index(
+    state: &tauri::State<AppState>,
+    query: String,
+    extensions: Option<String>,
+    category: Option<String>,
+    limit: Option<u32>,
+    _use_fuzzy: Option<bool>,
+    offset: Option<u32>,
+) -> Result<FindFilesResponse, String> {
+    const DEFAULT_LIMIT: u32 = 500;
+    let limit = limit.unwrap_or(DEFAULT_LIMIT) as usize;
+    let offset = offset.unwrap_or(0) as usize;
+    let total_start = Instant::now();
+
+    write_debug_log(state, &format!(
+        ">>> find_files_in_ngram_index start query_len={} limit={} offset={}",
+        query.len(), limit, offset,
+    ));
+
+    let index_arc = {
+        let guard = state.trigram_index.lock().unwrap();
+        let lock_ms = total_start.elapsed().as_millis();
+        match guard.as_ref() {
+            Some(idx) => {
+                write_debug_log(state, &format!(
+                    "find_files_in_ngram_index got_index objects={} lock_ms={}",
+                    idx.objects.len(), lock_ms,
+                ));
+                idx.clone()
+            }
+            None => {
+                write_debug_log(state, "find_files_in_ngram_index no_active_index");
+                return Ok(FindFilesResponse { items: vec![], next_offset: None });
+            }
+        }
+    };
+
+    let has_filter = extensions.as_ref().map_or(false, |s| !s.trim().is_empty())
+        || category.as_deref().map_or(false, |c| !c.trim().is_empty() && c.trim() != "all");
+
+    // When filtering, overfetch so we have enough candidates to fill a page after post-filtering.
+    // Pagination is disabled when filtering because filtered counts are not easily predictable.
+    let (fetch_limit, fetch_offset) = if has_filter {
+        ((limit * 4).max(2000), 0usize)
+    } else {
+        (limit, offset)
+    };
+
+    let search_start = Instant::now();
+    let (disk_entries, has_more_raw) = trigram_find_files(
+        &index_arc,
+        &query,
+        &SearchFilter::None,
+        fetch_limit,
+        fetch_offset,
+    );
+    let search_ms = search_start.elapsed().as_millis();
+
+    write_debug_log(state, &format!(
+        "find_files_in_ngram_index search done candidates={} has_more={} search_ms={}",
+        disk_entries.len(), has_more_raw, search_ms,
+    ));
+
+    let filter_start = Instant::now();
+    let extension_set: Option<std::collections::HashSet<String>> = extensions.as_ref().and_then(|s| {
+        let cleaned: Vec<String> = s.split(',')
+            .map(|x| x.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|x| !x.is_empty())
+            .collect();
+        if cleaned.is_empty() { None } else { Some(cleaned.into_iter().collect()) }
+    });
+
+    let (items, next_offset) = if has_filter {
+        let category_ref = category.as_deref();
+        let filtered: Vec<SearchEntry> = disk_entries.iter()
+            .filter(|o| {
+                if let Some(ref set) = extension_set {
+                    match o.kind {
+                        DiskObjectKind::File => o.ext.as_ref().map(|e| set.contains(e)).unwrap_or(false),
+                        DiskObjectKind::Folder => true,
+                    }
+                } else {
+                    category_filter::category_allowed(category_ref, o)
+                }
+            })
+            .take(limit)
+            .map(|o| search_entry_from_disk_object(o))
+            .collect();
+        (filtered, None)
+    } else {
+        let items: Vec<SearchEntry> = disk_entries.iter().map(|o| search_entry_from_disk_object(o)).collect();
+        let next_offset = if has_more_raw { Some(offset + limit) } else { None };
+        (items, next_offset)
+    };
+    let filter_ms = filter_start.elapsed().as_millis();
+
+    let total_ms = total_start.elapsed().as_millis();
+    write_debug_log(state, &format!(
+        "find_files_in_ngram_index done search_ms={} filter_ms={} total_ms={} count={} next_offset={:?}",
+        search_ms, filter_ms, total_ms, items.len(), next_offset,
+    ));
+
+    Ok(FindFilesResponse { items, next_offset })
+}
+
 fn find_files_in_compressed_text_index(
     state: &tauri::State<AppState>,
     query: String,
@@ -1553,6 +1731,7 @@ pub fn run() {
 
             let mut initial_disk_objects: Option<Arc<Vec<DiskObject>>> = None;
             let mut initial_name_index: Option<Arc<SuffixIndex>> = None;
+            let mut initial_trigram_index: Option<Arc<TrigramIndex>> = None;
 
             if !force_fresh && uses_in_memory_index(index_mode) {
                 let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
@@ -1560,45 +1739,58 @@ pub fn run() {
                     let mut objs = db::get_disk_objects(&conn).unwrap_or_default();
                     objs.sort_by(|a, b| a.path.cmp(&b.path));
 
-                    let t_suffix = Instant::now();
-                    let meta = db::read_scan_metadata(&conn).ok().flatten();
-                    let index_is_current = meta.as_ref().map_or(false, |m| {
-                        m.disk_objects_update_id != 0
-                            && m.suffix_index_update_id == m.disk_objects_update_id
-                    });
-
-                    let (name_index, index_source) = if index_is_current {
-                        match db::read_suffix_index_data(&conn) {
-                            Ok(Some((buffer, offsets, disk_object_indices))) => {
-                                let st = SuffixTable::new(buffer.clone());
-                                let idx = SuffixIndex { st, offsets, disk_object_indices, buffer };
-                                (idx, "db")
-                            }
-                            _ => {
-                                let idx = suffix_build_index(&objs);
-                                (idx, "rebuild-fallback")
-                            }
-                        }
+                    if index_mode == SearchIndexMode::InMemoryNgrams {
+                        let t0 = Instant::now();
+                        let index = trigram_build_index(&objs);
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "startup trigram_index objects={} ms={}",
+                            objs.len(), t0.elapsed().as_millis(),
+                        );
+                        initial_disk_objects = Some(Arc::new(objs));
+                        initial_trigram_index = Some(Arc::new(index));
                     } else {
-                        let idx = suffix_build_index(&objs);
-                        if let Some(m) = &meta {
-                            if m.disk_objects_update_id != 0 {
-                                let _ = db::write_suffix_index_data(
-                                    &conn, m.disk_objects_update_id,
-                                    &idx.buffer, &idx.offsets, &idx.disk_object_indices,
-                                );
-                            }
-                        }
-                        (idx, "rebuild")
-                    };
+                        // InMemorySuffix: load from DB if available, rebuild otherwise
+                        let t_suffix = Instant::now();
+                        let meta = db::read_scan_metadata(&conn).ok().flatten();
+                        let index_is_current = meta.as_ref().map_or(false, |m| {
+                            m.disk_objects_update_id != 0
+                                && m.suffix_index_update_id == m.disk_objects_update_id
+                        });
 
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "startup suffix_index objects={} source={} total_ms={}",
-                        objs.len(), index_source, t_suffix.elapsed().as_millis(),
-                    );
-                    initial_disk_objects = Some(Arc::new(objs));
-                    initial_name_index = Some(Arc::new(name_index));
+                        let (name_index, index_source) = if index_is_current {
+                            match db::read_suffix_index_data(&conn) {
+                                Ok(Some((buffer, offsets, disk_object_indices))) => {
+                                    let st = SuffixTable::new(buffer.clone());
+                                    let idx = SuffixIndex { st, offsets, disk_object_indices, buffer };
+                                    (idx, "db")
+                                }
+                                _ => {
+                                    let idx = suffix_build_index(&objs);
+                                    (idx, "rebuild-fallback")
+                                }
+                            }
+                        } else {
+                            let idx = suffix_build_index(&objs);
+                            if let Some(m) = &meta {
+                                if m.disk_objects_update_id != 0 {
+                                    let _ = db::write_suffix_index_data(
+                                        &conn, m.disk_objects_update_id,
+                                        &idx.buffer, &idx.offsets, &idx.disk_object_indices,
+                                    );
+                                }
+                            }
+                            (idx, "rebuild")
+                        };
+
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "startup suffix_index objects={} source={} ms={}",
+                            objs.len(), index_source, t_suffix.elapsed().as_millis(),
+                        );
+                        initial_disk_objects = Some(Arc::new(objs));
+                        initial_name_index = Some(Arc::new(name_index));
+                    }
                 }
             }
 
@@ -1607,6 +1799,7 @@ pub fn run() {
                 debug_log: Mutex::new(Some(debug_log_path)),
                 disk_objects: Mutex::new(initial_disk_objects),
                 name_reverse_index: Mutex::new(initial_name_index),
+                trigram_index: Mutex::new(initial_trigram_index),
                 phase2_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
                 is_scanning: AtomicBool::new(false),
                 scan_path_override: scan_path_override.clone(),

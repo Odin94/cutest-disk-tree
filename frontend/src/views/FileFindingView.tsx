@@ -102,8 +102,12 @@ export const FileFindingView = ({ result, loading, error, progress, scanPhaseSta
       setSearchResults([]);
       setSearchNextOffset(null);
       setSearchError(null);
+      const t0 = performance.now();
+      debugLog(`find_files invoke_start query_len=${searchQuery.length} category=${searchCategory}`);
       findFiles(searchQuery, extensions, searchCategory, useFuzzySearch, PAGE_SIZE, 0)
         .then((response) => {
+          const ipcMs = Math.round(performance.now() - t0);
+          debugLog(`find_files ipc_done ipc_total_ms=${ipcMs} items=${response.items.length} has_more=${response.nextOffset != null}`);
           lastQueryRef.current = queryKey;
           setSearchResults(response.items);
           setSearchNextOffset(response.nextOffset);

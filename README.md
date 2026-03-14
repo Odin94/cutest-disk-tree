@@ -99,6 +99,34 @@ If you prefer not to use the script:
 
 After that, existing installs will see the update when users click “Check for updates”.
 
+## Benchmarking indexing strategies
+
+The `benchmark` binary compares the three search-indexing strategies (suffix array, SQLite, compressed-text LZ4) against each other using the path set in `CUTE_DISK_TREE_SCAN_PATH` in `.env`.  It runs 3 iterations and prints a detailed report covering per-step build times, per-query find times, averages, and worst-case figures.
+
+**Build** (release mode is required for meaningful numbers):
+
+```bash
+cargo build --bin benchmark --release
+```
+
+**Run and save output to a timestamped file**:
+
+```bash
+# bash / MSYS / Git Bash
+mkdir -p benchmark
+cargo run --bin benchmark --release 2>&1 | tee "./benchmark/$(date +%Y-%m-%dT%H-%M-%S).txt"
+```
+
+```powershell
+# PowerShell
+New-Item -ItemType Directory -Force benchmark | Out-Null
+cargo run --bin benchmark --release 2>&1 | Tee-Object -FilePath "benchmark/$(Get-Date -Format 'yyyy-MM-ddTHH-mm-ss').txt"
+```
+
+Results are written to `./benchmark/<timestamp>.txt`. The `benchmark/` directory is git-ignored so you can accumulate runs locally without committing them.
+
+See [`ignored/benchmarks.md`](ignored/benchmarks.md) for a full explanation of what the benchmark measures, the fairness decisions behind it, and analysis of how each strategy could be improved.
+
 ## CLI indexer (prototype)
 
 Walk a directory tree, aggregate folder sizes, and avoid double-counting hard links.

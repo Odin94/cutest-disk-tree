@@ -48,3 +48,6 @@ test-data/
 TODOs.md
 
 ignored/
+
+# Saved benchmark runs (accumulate locally, don't commit)
+benchmark/

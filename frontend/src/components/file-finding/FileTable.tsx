@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -23,6 +23,7 @@ import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import type { FileSearchResult } from "../../types";
 import { humanSize } from "../../utils";
+import { debugLog } from "../../api";
 
 const getFileName = (path: string): string => {
   const segments = path.split(/[/\\]/);
@@ -446,6 +447,20 @@ export const FileTable = ({
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
+
+  // Render-commit timing: fires synchronously after DOM mutation (before paint).
+  // Combined with the ipc_done log in FileFindingView, this shows how long React
+  // took to sort + render the new file list.
+  const renderStartRef = useRef<number>(0);
+  useLayoutEffect(() => {
+    renderStartRef.current = performance.now();
+  }, [files]);
+  // useEffect fires after the browser has painted — gives total "data → visible" latency.
+  useEffect(() => {
+    if (files.length === 0 && !searchLoading) return; // skip empty/loading state
+    const paintMs = Math.round(performance.now() - renderStartRef.current);
+    debugLog(`FileTable render_paint_ms=${paintMs} files=${files.length}`);
+  }, [files, searchLoading]);
 
   const toggleSort = (field: SortField) => {
     if (sortField === field) {

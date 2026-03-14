@@ -40,6 +40,7 @@ coverage/
 *.profdata
 
 .cursor/
+.claude/
 .tauri-private-key
 .tauri-public-key.decoded
 

@@ -4,12 +4,14 @@ import { scanDirectory, onScanProgress, loadCachedScan, debugLog, onScanPhaseSta
 import type { ScanResult, ScanProgress, FolderSizesReady, ScanDirectoryResponse } from "./types";
 import "./App.css";
 import { DiskUsageView } from "./views/DiskUsageView";
-import { FileFindingView } from "./views/FileFindingView";
+import { FileFindingView, type TabId } from "./views/FileFindingView";
+import { TitleBar } from "./components/TitleBar";
 
 type CategoryId = "disk" | "find";
 
 const App = () => {
   const [category, setCategory] = useState<CategoryId>("find");
+  const [activeTab, setActiveTab] = useState<TabId>("find");
   const [result, setResult] = useState<ScanResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
@@ -169,28 +171,15 @@ const App = () => {
       className={`app ${category === "disk" ? "app-dashboard-layout" : ""}`}
     >
       <Toaster />
-      <nav className="nav-categories">
-        <button
-          type="button"
-          className={category === "disk" ? "active" : ""}
-          onClick={() => {
-            debugLog("App setCategory disk");
-            setCategory("disk");
-          }}
-        >
-          Disk usage
-        </button>
-        <button
-          type="button"
-          className={category === "find" ? "active" : ""}
-          onClick={() => {
-            debugLog("App setCategory find");
-            setCategory("find");
-          }}
-        >
-          File finding
-        </button>
-      </nav>
+      <TitleBar
+        category={category}
+        activeTab={activeTab}
+        onNavigate={(cat, tab) => {
+          debugLog(`App navigate category=${cat} tab=${tab ?? ""}`);
+          setCategory(cat);
+          if (tab != null) setActiveTab(tab);
+        }}
+      />
 
       <div className="views">
         <div
@@ -216,6 +205,8 @@ const App = () => {
             scanPhaseStatus={scanPhaseStatus}
             onScan={runScan}
             onCancelScan={cancelScan}
+            activeTab={activeTab}
+            onTabChange={setActiveTab}
           />
         </div>
       </div>

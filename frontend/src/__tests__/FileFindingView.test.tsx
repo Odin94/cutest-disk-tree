@@ -46,6 +46,8 @@ describe("FileFindingView", () => {
     progress: null as ScanProgress | null,
     onScan: vi.fn(),
     onCancelScan: vi.fn(),
+    activeTab: "find" as const,
+    onTabChange: vi.fn(),
   };
 
   beforeEach(() => {
@@ -114,17 +116,13 @@ describe("FileFindingView", () => {
     expect(screen.getByText("files indexed")).toBeInTheDocument();
   });
 
-  it("shows tabs when result is loaded", () => {
-    render(<FileFindingView {...defaultProps} result={makeScan()} />);
-    expect(screen.getByRole("button", { name: /find files/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /largest folders/i })).toBeInTheDocument();
+  it("shows find files content when activeTab is find", () => {
+    render(<FileFindingView {...defaultProps} result={makeScan()} activeTab="find" />);
+    expect(screen.getByPlaceholderText(/search your cozy file collection/i)).toBeInTheDocument();
   });
 
-  it("switches to folders tab and shows folder list", async () => {
-    const user = userEvent.setup();
-    render(<FileFindingView {...defaultProps} result={makeScan()} />);
-    const foldersTab = screen.getByRole("button", { name: /largest folders/i });
-    await user.click(foldersTab);
+  it("shows folder list when activeTab is folders", () => {
+    render(<FileFindingView {...defaultProps} result={makeScan()} activeTab="folders" />);
     expect(screen.getByText("C:\\data")).toBeInTheDocument();
   });
 });

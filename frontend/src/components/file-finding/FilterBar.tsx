@@ -16,8 +16,6 @@ type FileCategory =
 type FilterBarProps = {
   activeCategory: FileCategory;
   onCategoryChange: (cat: FileCategory) => void;
-  extensionFilter: string;
-  onExtensionFilterChange: (ext: string) => void;
   disabled?: boolean;
 };
 
@@ -37,8 +35,6 @@ const categories: { value: FileCategory; label: string; icon: typeof FileText; c
 export const FilterBar = ({
   activeCategory,
   onCategoryChange,
-  extensionFilter,
-  onExtensionFilterChange,
   disabled = false,
 }: FilterBarProps) => (
   <motion.div
@@ -68,18 +64,6 @@ export const FilterBar = ({
           </motion.button>
         );
       })}
-    </div>
-
-    <div className="glass rounded-2xl px-4 py-2 flex items-center gap-2">
-      <span className="text-sm text-muted-foreground">ext:</span>
-      <input
-        type="text"
-        value={extensionFilter}
-        onChange={(e) => onExtensionFilterChange(e.target.value)}
-        placeholder=".pdf, .tsx..."
-        disabled={disabled}
-        className="bg-transparent border-none outline-none text-foreground text-sm w-28 placeholder:text-muted-foreground disabled:opacity-60"
-      />
     </div>
   </motion.div>
 );

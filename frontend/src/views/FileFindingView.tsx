@@ -10,7 +10,7 @@ import { FolderList } from "../components/file-finding/FolderList";
 import type { FileSearchResult, ScanProgress, ScanResult } from "../types";
 import cozyBg from "../assets/cozy-bg.jpg";
 
-type TabId = "find" | "folders";
+export type TabId = "find" | "folders";
 type FileCategory = "all" | "audio" | "document" | "video" | "image" | "executable" | "compressed" | "config" | "folder" | "other";
 
 export const MAX_VISIBLE_FILES = 500;
@@ -23,6 +23,8 @@ type FileFindingViewProps = {
   scanPhaseStatus?: string;
   onScan: () => void;
   onCancelScan?: () => void;
+  activeTab: TabId;
+  onTabChange: (tab: TabId) => void;
 };
 
 export const getFileName = (path: string): string => {
@@ -30,8 +32,7 @@ export const getFileName = (path: string): string => {
   return segments[segments.length - 1] ?? path;
 };
 
-export const FileFindingView = ({ result, loading, error, progress, scanPhaseStatus = "", onScan, onCancelScan }: FileFindingViewProps) => {
-  const [activeTab, setActiveTab] = useState<TabId>("find");
+export const FileFindingView = ({ result, loading, error, progress, scanPhaseStatus = "", onScan, onCancelScan, activeTab }: FileFindingViewProps) => {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchExtensions, setSearchExtensions] = useState("");
   const [searchCategory, setSearchCategory] = useState<FileCategory>("all");
@@ -218,33 +219,6 @@ export const FileFindingView = ({ result, loading, error, progress, scanPhaseSta
 
         {result !== null && !loading ? (
           <>
-            <div className="flex items-center gap-1.5 glass rounded-2xl p-1.5">
-              <button
-                type="button"
-                onClick={() => {
-                  debugLog("FileFindingView click tab find");
-                  setActiveTab("find");
-                }}
-                className={`px-4 py-2 rounded-xl text-sm font-medium transition-all cursor-pointer ${
-                  activeTab === "find" ? "bg-primary text-primary-foreground shadow-cozy" : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Find files
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  debugLog("FileFindingView click tab folders");
-                  setActiveTab("folders");
-                }}
-                className={`px-4 py-2 rounded-xl text-sm font-medium transition-all cursor-pointer ${
-                  activeTab === "folders" ? "bg-primary text-primary-foreground shadow-cozy" : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                Largest folders
-              </button>
-            </div>
-
             {activeTab === "folders" ? (
               <FolderList folders={folderList} />
             ) : (
@@ -254,13 +228,13 @@ export const FileFindingView = ({ result, loading, error, progress, scanPhaseSta
                   onQueryChange={setSearchQuery}
                   useFuzzySearch={useFuzzySearch}
                   onFuzzySearchChange={setUseFuzzySearch}
+                  extensionFilter={searchExtensions}
+                  onExtensionFilterChange={setSearchExtensions}
                   disabled={!canSearch}
                 />
                 <FilterBar
                   activeCategory={searchCategory}
                   onCategoryChange={setSearchCategory}
-                  extensionFilter={searchExtensions}
-                  onExtensionFilterChange={setSearchExtensions}
                   disabled={!canSearch}
                 />
                 {searchError != null ? (

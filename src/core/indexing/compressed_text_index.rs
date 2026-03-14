@@ -9,6 +9,25 @@ use crate::{DiskObject, DiskObjectKind, FileEntry};
 use crate::core::indexing::sqlite::SearchFilter;
 use crate::parent_dir;
 
+pub fn build_index(
+    index_path: &Path,
+    files: &[FileEntry],
+    folder_sizes: &std::collections::HashMap<std::path::PathBuf, u64>,
+) -> CompressedTextIndexResult<()> {
+    write_compressed_text_index(index_path, files, folder_sizes)
+}
+
+pub fn find_files(
+    index_path: &Path,
+    query: &str,
+    filter: &SearchFilter,
+    limit: usize,
+    offset: usize,
+) -> CompressedTextIndexResult<(Vec<DiskObject>, bool)> {
+    let (results, has_more, _) = search_compressed_text_index(index_path, query, filter, limit, offset)?;
+    Ok((results, has_more))
+}
+
 const KIND_FILE: u8 = b'f';
 const KIND_FOLDER: u8 = b'd';
 

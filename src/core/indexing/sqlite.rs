@@ -5,6 +5,21 @@ use std::time::Instant;
 use crate::{DiskObject, DiskObjectKind};
 use crate::core::search_category;
 
+pub fn build_index() {
+    // No-op: SQLite index is maintained in the database; no in-memory structure needed.
+}
+
+pub fn find_files(
+    conn: &Connection,
+    query: &str,
+    filter: &SearchFilter,
+    limit: usize,
+    offset: usize,
+) -> rusqlite::Result<(Vec<DiskObject>, bool)> {
+    let (results, has_more, _) = search_disk_objects_by_name(conn, query, filter, limit, offset)?;
+    Ok((results, has_more))
+}
+
 #[derive(Clone, Debug)]
 pub enum SearchFilter {
     None,

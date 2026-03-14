@@ -84,8 +84,8 @@ fn suffix_index_skips_folders() {
         mtime: None,
     });
 
-    let (index, ..) = build_suffix_index(&objs);
-    let candidates = search_suffix_index(&index, "notes")
+    let index = suffix_build_index(&objs);
+    let candidates = suffix_find_files(&index, "notes")
         .expect("should match the file");
 
     assert!(candidates.contains(&0));

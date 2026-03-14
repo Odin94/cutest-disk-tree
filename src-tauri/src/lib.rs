@@ -1,10 +1,13 @@
 use cutest_disk_tree::{db, DiskObject, DiskObjectKind};
 use cutest_disk_tree::core::indexing::compressed_text_index::{
-    write_compressed_text_index, search_compressed_text_index, compressed_text_index_exists,
-    write_scan_metadata, read_scan_metadata, read_scan_result_from_compressed_text_index,
+    build_index as cti_build_index, find_files as cti_find_files,
+    compressed_text_index_exists, write_scan_metadata, read_scan_metadata,
+    read_scan_result_from_compressed_text_index,
 };
-use cutest_disk_tree::core::indexing::suffix::{SuffixIndex, build_suffix_index, search_suffix_index};
-use cutest_disk_tree::core::indexing::sqlite::{search_disk_objects_by_name, SearchFilter};
+use cutest_disk_tree::core::indexing::suffix::{
+    SuffixIndex, build_index as suffix_build_index, find_files as suffix_find_files,
+};
+use cutest_disk_tree::core::indexing::sqlite::{find_files as sqlite_find_files, SearchFilter};
 use cutest_disk_tree::core::search_category;
 use std::collections::{HashMap, HashSet};
 use suffix::SuffixTable;
@@ -418,22 +421,22 @@ fn activate_initial_index(
 
     let _ = app.emit("scan-phase-status", "building suffix index...".to_string());
     write_debug_log(state, "activate_initial_index building suffix index");
-    let (index, suffix_concat_ms, suffix_table_ms) = build_suffix_index(&objs);
+    let index = suffix_build_index(&objs);
     write_debug_log(state, &format!(
-        "activate_initial_index build_suffix_index done suffix_concat_ms={} suffix_table_ms={} total_ms={}",
-        suffix_concat_ms, suffix_table_ms, t0.elapsed().as_millis(),
+        "activate_initial_index build_index done total_ms={}",
+        t0.elapsed().as_millis(),
     ));
 
     if cancel.load(Ordering::Relaxed) {
         write_debug_log(state, &format!(
-            "activate_initial_index cancelled after build_suffix_index ms={}", t0.elapsed().as_millis(),
+            "activate_initial_index cancelled after build_index ms={}", t0.elapsed().as_millis(),
         ));
         return;
     }
 
     write_debug_log(state, &format!(
-        "activate_initial_index done files={} folders={} objects={} build_disk_objs_ms={} suffix_concat_ms={} suffix_table_ms={} total_ms={}",
-        files.len(), folder_paths.len(), objs.len(), build_ms, suffix_concat_ms, suffix_table_ms, t0.elapsed().as_millis(),
+        "activate_initial_index done files={} folders={} objects={} build_disk_objs_ms={} total_ms={}",
+        files.len(), folder_paths.len(), objs.len(), build_ms, t0.elapsed().as_millis(),
     ));
 
     {
@@ -547,7 +550,7 @@ fn run_phase2(
             folder_sizes.len(),
         ));
         let _ = app_bg.emit("scan-phase-status", "writing search index...".to_string());
-        match write_compressed_text_index(&cti_path, &files_bg, &folder_sizes) {
+        match cti_build_index(&cti_path, &files_bg, &folder_sizes) {
             Ok(()) => {
                 let ms = cti_start.elapsed().as_millis();
                 write_debug_log(
@@ -1189,7 +1192,7 @@ fn find_files_in_memory(
         let guard = state.name_reverse_index.lock().unwrap();
         guard
             .as_ref()
-            .and_then(|idx| search_suffix_index(idx.as_ref(), &q))
+            .and_then(|idx| suffix_find_files(idx.as_ref(), &q))
     };
     let suffix_search_ms = suffix_search_start.elapsed().as_millis();
     write_debug_log(state, &format!(
@@ -1316,7 +1319,7 @@ fn find_files_in_compressed_text_index(
     let cti_path = resolve_compressed_text_index_path(state);
     let filter = resolve_search_filter(extensions.as_deref(), category.as_deref());
 
-    let (disk_entries, has_more, timings) = search_compressed_text_index(
+    let (disk_entries, has_more) = cti_find_files(
         &cti_path,
         &query,
         &filter,
@@ -1335,8 +1338,8 @@ fn find_files_in_compressed_text_index(
     write_debug_log(
         state,
         &format!(
-            "find_files_in_compressed_text_index done open_ms={} scan_ms={} total_ms={} count={} next_offset={:?}",
-            timings.open_ms, timings.scan_ms, total_ms, items.len(), next_offset
+            "find_files_in_compressed_text_index done total_ms={} count={} next_offset={:?}",
+            total_ms, items.len(), next_offset
         ),
     );
 
@@ -1420,7 +1423,7 @@ fn find_files_in_db(
     let resolve_ms = resolve_start.elapsed().as_millis();
 
     let db_start = Instant::now();
-    let (disk_entries, has_more, sql_timings) = search_disk_objects_by_name(
+    let (disk_entries, has_more) = sqlite_find_files(
         &conn,
         &query,
         &filter,
@@ -1447,12 +1450,9 @@ fn find_files_in_db(
     write_debug_log(
         state,
         &format!(
-            "find_files_in_db profile resolve_ms={} db_total_ms={} (sql prepare_ms={} query_map_ms={} collect_ms={}) serialize_ms={} total_ms={} count={} next_offset={:?}",
+            "find_files_in_db profile resolve_ms={} db_total_ms={} serialize_ms={} total_ms={} count={} next_offset={:?}",
             resolve_ms,
             db_total_ms,
-            sql_timings.prepare_ms,
-            sql_timings.query_map_ms,
-            sql_timings.collect_ms,
             serialize_ms,
             total_ms,
             items.len(),
@@ -1575,12 +1575,12 @@ pub fn run() {
                                 (idx, "db")
                             }
                             _ => {
-                                let (idx, ..) = build_suffix_index(&objs);
+                                let idx = suffix_build_index(&objs);
                                 (idx, "rebuild-fallback")
                             }
                         }
                     } else {
-                        let (idx, ..) = build_suffix_index(&objs);
+                        let idx = suffix_build_index(&objs);
                         if let Some(m) = &meta {
                             if m.disk_objects_update_id != 0 {
                                 let _ = db::write_suffix_index_data(

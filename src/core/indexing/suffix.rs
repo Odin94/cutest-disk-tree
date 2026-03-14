@@ -13,6 +13,15 @@ pub struct SuffixIndex {
     pub buffer: String,
 }
 
+pub fn build_index(objects: &[DiskObject]) -> SuffixIndex {
+    let (index, _, _) = build_suffix_index(objects);
+    index
+}
+
+pub fn find_files(index: &SuffixIndex, query: &str) -> Option<HashSet<usize>> {
+    search_suffix_index(index, query)
+}
+
 pub fn build_suffix_index(objects: &[DiskObject]) -> (SuffixIndex, u128, u128) {
     let concat_start = Instant::now();
     let mut buffer = String::with_capacity(objects.len() * 16);

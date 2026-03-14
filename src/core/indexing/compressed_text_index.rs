@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
+use rayon::prelude::*;
 
 use crate::{DiskObject, DiskObjectKind, FileEntry};
 use crate::core::indexing::sqlite::SearchFilter;
@@ -10,6 +11,8 @@ use crate::parent_dir;
 
 const KIND_FILE: u8 = b'f';
 const KIND_FOLDER: u8 = b'd';
+
+const CTI_MAX_ENTRIES_PER_SHARD: usize = 200_000;
 
 type CompressedTextIndexResult<T> = Result<T, CompressedTextIndexError>;
 
@@ -37,81 +40,69 @@ fn basename(path: &str) -> &str {
     path.rsplit(sep).next().unwrap_or(path)
 }
 
-fn parse_line(line: &str) -> CompressedTextIndexResult<Option<DiskObject>> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(None);
+fn ascii_case_insensitive_contains(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
     }
-    let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() < 3 {
-        return Err(CompressedTextIndexError::Parse(format!("expected at least 3 fields, got {}", parts.len())));
+    let needle_bytes = needle_lower.as_bytes();
+    let nlen = needle_bytes.len();
+    let hay_bytes = haystack.as_bytes();
+    if nlen > hay_bytes.len() {
+        return false;
     }
-    let path = parts[0];
-    let kind_byte = parts[1].as_bytes().first().copied();
-    let size: u64 = parts[2].parse().map_err(|_| {
-        CompressedTextIndexError::Parse(format!("invalid size: {}", parts[2]))
-    })?;
-    let kind = match kind_byte {
-        Some(KIND_FILE) => DiskObjectKind::File,
-        Some(KIND_FOLDER) => DiskObjectKind::Folder,
-        _ => return Err(CompressedTextIndexError::Parse(format!("invalid kind: {:?}", kind_byte))),
-    };
-    let path_lower = path.to_ascii_lowercase();
-    let parent = parent_dir(path);
-    let name = basename(path).to_string();
-    let name_lower = name.to_ascii_lowercase();
-    let ext = match kind {
-        DiskObjectKind::File => std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_ascii_lowercase()),
-        DiskObjectKind::Folder => None,
-    };
-    let (size_opt, recursive_size_opt, dev, ino, mtime) = match kind {
-        DiskObjectKind::File => {
-            let dev = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let ino = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-            let mtime = parts.get(5).and_then(|s| s.parse().ok());
-            (Some(size), None, Some(dev), Some(ino), mtime)
+    'outer: for i in 0..=hay_bytes.len() - nlen {
+        for j in 0..nlen {
+            if hay_bytes[i + j].to_ascii_lowercase() != needle_bytes[j] {
+                continue 'outer;
+            }
         }
-        DiskObjectKind::Folder => (None, Some(size), None, None, None),
-    };
-    Ok(Some(DiskObject {
-        path: path.to_string(),
-        path_lower,
-        parent_path: if parent.is_empty() { None } else { Some(parent) },
-        name,
-        name_lower,
-        ext,
-        kind,
-        size: size_opt,
-        recursive_size: recursive_size_opt,
-        dev,
-        ino,
-        mtime,
-    }))
+        return true;
+    }
+    false
 }
 
-fn passes_filter(obj: &DiskObject, filter: &SearchFilter) -> bool {
-    match filter {
-        SearchFilter::None => true,
-        SearchFilter::FoldersOnly => matches!(obj.kind, DiskObjectKind::Folder),
-        SearchFilter::Other => {
-            if matches!(obj.kind, DiskObjectKind::Folder) {
-                return false;
-            }
-            let known = crate::core::search_category::all_known_extensions();
-            match &obj.ext {
-                None => true,
-                Some(ext) => !known.iter().any(|e| e.eq_ignore_ascii_case(ext)),
-            }
+fn parse_path_line(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    // Support both the new "path only" format and the older
+    // tab-separated format by always taking just the first field.
+    if let Some((path, _rest)) = line.split_once('\t') {
+        if path.is_empty() {
+            None
+        } else {
+            Some(path)
         }
-        SearchFilter::Extensions(exts) => {
-            if matches!(obj.kind, DiskObjectKind::Folder) {
-                return true;
-            }
-            obj.ext.as_ref().map(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e))).unwrap_or(false)
-        }
+    } else {
+        Some(line)
+    }
+}
+
+fn build_disk_object_from_path(path: &str) -> DiskObject {
+    let path_string = path.to_string();
+    let path_lower = path_string.to_ascii_lowercase();
+    let parent = parent_dir(path);
+    let name_string = basename(path).to_string();
+    let name_lower = name_string.to_ascii_lowercase();
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    DiskObject {
+        path: path_string,
+        path_lower,
+        parent_path: if parent.is_empty() { None } else { Some(parent) },
+        name: name_string,
+        name_lower,
+        ext,
+        kind: DiskObjectKind::File,
+        size: None,
+        recursive_size: None,
+        dev: None,
+        ino: None,
+        mtime: None,
     }
 }
 
@@ -120,38 +111,44 @@ pub fn write_compressed_text_index(
     files: &[FileEntry],
     folder_sizes: &std::collections::HashMap<std::path::PathBuf, u64>,
 ) -> CompressedTextIndexResult<()> {
-    let mut entries: Vec<(String, u8, u64, Option<u64>, Option<u64>, Option<i64>)> = Vec::with_capacity(files.len() + folder_sizes.len());
+    let mut paths: Vec<String> = Vec::with_capacity(files.len() + folder_sizes.len());
     for f in files {
         let path_str = f.path.to_string_lossy().to_string();
-        entries.push((
-            path_str,
-            KIND_FILE,
-            f.size,
-            Some(f.file_key.dev),
-            Some(f.file_key.ino),
-            f.mtime,
-        ));
+        paths.push(path_str);
     }
-    for (path, &size) in folder_sizes {
+    for (path, _size) in folder_sizes {
         let path_str = path.to_string_lossy().to_string();
-        entries.push((path_str, KIND_FOLDER, size, None, None, None));
+        paths.push(path_str);
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    paths.sort();
 
-    let file = File::create(index_path)?;
-    let writer = BufWriter::new(file);
-    let mut encoder = FrameEncoder::new(writer);
+    if paths.is_empty() {
+        let file = File::create(index_path)?;
+        let writer = BufWriter::new(file);
+        let mut encoder = FrameEncoder::new(writer);
+        encoder.finish()?;
+        return Ok(());
+    }
 
-    for (path, kind, size, dev, ino, mtime) in entries {
-        let line = match (kind, dev, ino, mtime) {
-            (KIND_FILE, Some(d), Some(i), m) => {
-                format!("{}\tf\t{}\t{}\t{}\t{}\n", path, size, d, i, m.unwrap_or(0))
-            }
-            _ => format!("{}\td\t{}\n", path, size),
+    let mut shard_index: usize = 0;
+    for chunk in paths.chunks(CTI_MAX_ENTRIES_PER_SHARD) {
+        let shard_path = if paths.len() <= CTI_MAX_ENTRIES_PER_SHARD {
+            index_path.to_path_buf()
+        } else {
+            std::path::PathBuf::from(format!("{}.{}", index_path.to_string_lossy(), shard_index))
         };
-        encoder.write_all(line.as_bytes())?;
+        shard_index += 1;
+
+        let file = File::create(shard_path)?;
+        let writer = BufWriter::new(file);
+        let mut encoder = FrameEncoder::new(writer);
+
+        for path in chunk {
+            encoder.write_all(path.as_bytes())?;
+            encoder.write_all(b"\n")?;
+        }
+        encoder.finish()?;
     }
-    encoder.finish()?;
     Ok(())
 }
 
@@ -165,52 +162,45 @@ pub struct CompressedTextIndexSearchTimings {
 pub fn search_compressed_text_index(
     index_path: &Path,
     query: &str,
-    filter: &SearchFilter,
+    _filter: &SearchFilter,
     limit: usize,
     offset: usize,
 ) -> CompressedTextIndexResult<(Vec<DiskObject>, bool, CompressedTextIndexSearchTimings)> {
     use std::time::Instant;
 
+    let query_lower = query.to_ascii_lowercase();
+    let query_is_empty = query_lower.is_empty();
+    let global_needed = limit.saturating_add(offset).saturating_add(1);
+
     let open_start = Instant::now();
-    let file = File::open(index_path)?;
-    let decoder = FrameDecoder::new(file);
-    let reader = BufReader::new(decoder);
+    let shard_paths = resolve_shard_paths(index_path);
     let open_ms = open_start.elapsed().as_millis();
 
-    let query_lower = query.to_ascii_lowercase();
-    let mut results: Vec<DiskObject> = Vec::with_capacity(limit + 1);
-    let mut skipped = 0usize;
-
     let scan_start = Instant::now();
-    for line in reader.lines() {
-        let line = line?;
-        let obj = match parse_line(&line)? {
-            Some(o) => o,
-            None => continue,
-        };
-        if !obj.name_lower.contains(&query_lower) {
-            continue;
-        }
-        if !passes_filter(&obj, filter) {
-            continue;
-        }
-        if skipped < offset {
-            skipped += 1;
-            continue;
-        }
-        results.push(obj);
-        if results.len() > limit {
-            break;
-        }
-    }
-    let scan_ms = scan_start.elapsed().as_millis();
+    let per_shard_limit = global_needed;
 
-    let has_more = results.len() > limit;
-    let truncated = if has_more {
-        results.into_iter().take(limit).collect()
-    } else {
-        results
-    };
+    let shard_results: Vec<CompressedTextIndexResult<Vec<DiskObject>>> = shard_paths
+        .par_iter()
+        .map(|shard_path| {
+            search_shard(shard_path, &query_lower, query_is_empty, per_shard_limit)
+        })
+        .collect();
+
+    let mut combined: Vec<DiskObject> = Vec::new();
+    for res in shard_results {
+        let mut v = res?;
+        combined.append(&mut v);
+    }
+
+    combined.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let has_more = combined.len() > global_needed;
+
+    let start = offset.min(combined.len());
+    let end = (start + limit).min(combined.len());
+    let truncated = combined[start..end].to_vec();
+
+    let scan_ms = scan_start.elapsed().as_millis();
 
     let timings = CompressedTextIndexSearchTimings {
         open_ms,
@@ -221,8 +211,67 @@ pub fn search_compressed_text_index(
     Ok((truncated, has_more, timings))
 }
 
+fn resolve_shard_paths(index_path: &Path) -> Vec<std::path::PathBuf> {
+    if index_path.is_file() {
+        return vec![index_path.to_path_buf()];
+    }
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut shard_index: usize = 0;
+    loop {
+        let shard_path = std::path::PathBuf::from(format!(
+            "{}.{}",
+            index_path.to_string_lossy(),
+            shard_index
+        ));
+        if !shard_path.is_file() {
+            break;
+        }
+        paths.push(shard_path);
+        shard_index += 1;
+    }
+    paths
+}
+
+fn search_shard(
+    shard_path: &Path,
+    query_lower: &str,
+    query_is_empty: bool,
+    limit: usize,
+) -> CompressedTextIndexResult<Vec<DiskObject>> {
+    let file = File::open(shard_path)?;
+    let decoder = FrameDecoder::new(file);
+    let mut reader = BufReader::new(decoder);
+
+    let mut results: Vec<DiskObject> = Vec::with_capacity(limit);
+    let mut line_buf = String::new();
+    loop {
+        line_buf.clear();
+        let bytes_read = reader.read_line(&mut line_buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        let path = match parse_path_line(&line_buf) {
+            Some(p) => p,
+            None => continue,
+        };
+        let name = basename(path);
+        if !query_is_empty && !ascii_case_insensitive_contains(name, query_lower) {
+            continue;
+        }
+        results.push(build_disk_object_from_path(path));
+        if results.len() >= limit {
+            break;
+        }
+    }
+    Ok(results)
+}
+
 pub fn compressed_text_index_exists(index_path: &Path) -> bool {
-    index_path.is_file()
+    if index_path.is_file() {
+        return true;
+    }
+    let first_shard = std::path::PathBuf::from(format!("{}.0", index_path.to_string_lossy()));
+    first_shard.is_file()
 }
 
 pub fn write_scan_metadata(
@@ -258,46 +307,46 @@ pub fn read_scan_metadata(metadata_path: &Path) -> std::io::Result<Option<crate:
 pub fn read_scan_result_from_compressed_text_index(
     index_path: &Path,
 ) -> CompressedTextIndexResult<crate::ScanResult> {
-    let file = File::open(index_path)?;
-    let decoder = FrameDecoder::new(file);
-    let reader = BufReader::new(decoder);
+    let shard_paths = resolve_shard_paths(index_path);
 
     let mut files: Vec<crate::FileEntrySer> = Vec::new();
     let mut folder_sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
-    for line in reader.lines() {
-        let line = line?;
-        let obj = match parse_line(&line)? {
-            Some(o) => o,
-            None => continue,
-        };
-        match obj.kind {
-            crate::DiskObjectKind::File => {
-                files.push(crate::FileEntrySer {
-                    path: obj.path,
-                    size: obj.size.unwrap_or(0),
-                    file_key: crate::FileKey {
-                        dev: obj.dev.unwrap_or(0),
-                        ino: obj.ino.unwrap_or(0),
-                    },
-                    mtime: obj.mtime,
-                });
+    for shard_path in shard_paths {
+        let file = File::open(&shard_path)?;
+        let decoder = FrameDecoder::new(file);
+        let mut reader = BufReader::new(decoder);
+
+        let mut line_buf = String::new();
+        loop {
+            line_buf.clear();
+            let bytes_read = reader.read_line(&mut line_buf)?;
+            if bytes_read == 0 {
+                break;
             }
-            crate::DiskObjectKind::Folder => {
-                if let Some(s) = obj.recursive_size {
-                    folder_sizes.insert(obj.path, s);
-                }
-            }
+            let path = match parse_path_line(&line_buf) {
+                Some(p) => p,
+                None => continue,
+            };
+            files.push(crate::FileEntrySer {
+                path: path.to_string(),
+                size: 0,
+                file_key: crate::FileKey { dev: 0, ino: 0 },
+                mtime: None,
+            });
         }
     }
 
-    let roots: Vec<String> = folder_sizes
-        .keys()
-        .filter(|path| {
-            let p = std::path::Path::new(path);
-            p.parent().is_none() || p.parent() == Some(std::path::Path::new("")) || path.len() <= 3
+    let roots: Vec<String> = files
+        .iter()
+        .filter_map(|f| {
+            let p = std::path::Path::new(&f.path);
+            if p.parent().is_none() || p.parent() == Some(std::path::Path::new("")) || f.path.len() <= 3 {
+                Some(f.path.clone())
+            } else {
+                None
+            }
         })
-        .cloned()
         .collect();
 
     Ok(crate::ScanResult {

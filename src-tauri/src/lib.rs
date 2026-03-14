@@ -540,14 +540,62 @@ fn run_phase2(
         let app_data_dir = db_path_bg.parent().unwrap_or(&db_path_bg);
         let cti_path = app_data_dir.join("index.compressed-text-index.lz4");
         let metadata_path = app_data_dir.join("scan-metadata.json");
-        write_debug_log(&state_ptr, "phase2 writing compressed text index");
+        let cti_start = Instant::now();
+        write_debug_log(&state_ptr, &format!(
+            "phase2 writing compressed text index files={} folders={}",
+            files_bg.len(),
+            folder_sizes.len(),
+        ));
         let _ = app_bg.emit("scan-phase-status", "writing search index...".to_string());
         match write_compressed_text_index(&cti_path, &files_bg, &folder_sizes) {
-            Ok(()) => write_debug_log(&state_ptr, &format!("phase2 cti_write done path={}", cti_path.display())),
-            Err(e) => write_debug_log(&state_ptr, &format!("phase2 cti_write failed error={:?}", e)),
+            Ok(()) => {
+                let ms = cti_start.elapsed().as_millis();
+                write_debug_log(
+                    &state_ptr,
+                    &format!(
+                        "phase2 cti_write done path={} ms={} files={} folders={}",
+                        cti_path.display(),
+                        ms,
+                        files_bg.len(),
+                        folder_sizes.len(),
+                    ),
+                );
+            }
+            Err(e) => {
+                let ms = cti_start.elapsed().as_millis();
+                write_debug_log(
+                    &state_ptr,
+                    &format!(
+                        "phase2 cti_write failed error={:?} ms={} files={} folders={}",
+                        e,
+                        ms,
+                        files_bg.len(),
+                        folder_sizes.len(),
+                    ),
+                );
+            }
         }
+        let meta_start = Instant::now();
         if let Err(e) = write_scan_metadata(&metadata_path, &roots_str, files_bg.len() as u64, &folder_sizes) {
-            write_debug_log(&state_ptr, &format!("phase2 scan_metadata write failed error={:?}", e));
+            let ms = meta_start.elapsed().as_millis();
+            write_debug_log(
+                &state_ptr,
+                &format!(
+                    "phase2 scan_metadata write failed error={:?} ms={}",
+                    e,
+                    ms,
+                ),
+            );
+        } else {
+            let ms = meta_start.elapsed().as_millis();
+            write_debug_log(
+                &state_ptr,
+                &format!(
+                    "phase2 scan_metadata write done path={} ms={}",
+                    metadata_path.display(),
+                    ms,
+                ),
+            );
         }
     } else if mode == SearchIndexMode::Sqlite {
         write_debug_log(&state_ptr, "phase2 opening database");

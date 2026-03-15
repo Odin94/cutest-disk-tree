@@ -703,6 +703,213 @@ fn run_phase2(
     let _ = app_bg.emit("scan-phase-status", "".to_string());
 }
 
+/// Mirror of the types written by `mft-helper` — used only for JSON deserialisation.
+#[derive(serde::Deserialize)]
+struct MftFileEntry {
+    path: String,
+    size: u64,
+    dev: u64,
+    ino: u64,
+    mtime: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct MftScanOutput {
+    files: Vec<MftFileEntry>,
+    folders: Vec<String>,
+}
+
+/// Run a fast MFT scan by launching the `mft-helper` binary with UAC elevation
+/// via PowerShell `Start-Process -Verb RunAs -Wait`. The helper writes JSON to
+/// a temp file; we read it back and proceed exactly like `scan_directory`.
+#[tauri::command]
+async fn scan_directory_with_helper(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ScanDirectoryResponse, String> {
+    write_debug_log(&state, "scan_directory_with_helper called");
+
+    if state.is_scanning.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        write_debug_log(&state, "scan_directory_with_helper rejected: scan already in progress");
+        return Err("A scan is already in progress".to_string());
+    }
+
+    let scan_roots: Vec<std::path::PathBuf> = match &state.scan_path_override {
+        Some(p) => vec![std::path::PathBuf::from(p)],
+        None => cutest_disk_tree::get_filesystem_roots(),
+    };
+
+    write_debug_log(&state, &format!("scan_directory_with_helper roots={:?}", scan_roots));
+
+    let db_path = state.db_path.clone();
+    let scan_log_path = resolve_debug_log_path(&state);
+    let app_for_scan = app.clone();
+    let scan_start = Instant::now();
+
+    // Find the helper binary: it lives next to the current executable.
+    let helper_exe = std::env::current_exe()
+        .map_err(|e| format!("cannot find current exe: {}", e))?
+        .parent()
+        .ok_or("cannot get exe directory")?
+        .join("mft-helper.exe");
+
+    if !helper_exe.exists() {
+        state.is_scanning.store(false, Ordering::SeqCst);
+        return Err(format!(
+            "mft-helper.exe not found at {}",
+            helper_exe.display()
+        ));
+    }
+
+    // Collect MFT output from every scan root.
+    let mut all_mft_files: Vec<MftFileEntry> = Vec::new();
+    let mut all_folder_strings: Vec<String> = Vec::new();
+    let mut roots_str: Vec<String> = Vec::new();
+
+    for root in &scan_roots {
+        roots_str.push(root.to_string_lossy().into_owned());
+
+        // Create a temp file for the helper to write its JSON output into.
+        let tmp_path = std::env::temp_dir().join(format!(
+            "mft-scan-{}.json",
+            root.to_string_lossy().replace([':', '\\', '/'], "_")
+        ));
+
+        let helper_path_str = helper_exe.to_string_lossy().into_owned();
+        let root_str = root.to_string_lossy().into_owned();
+        let tmp_str = tmp_path.to_string_lossy().into_owned();
+
+        // Run: powershell -WindowStyle Hidden -Command
+        //   "Start-Process -FilePath '<helper>' -ArgumentList '<root>','<tmp>' -Verb RunAs -Wait"
+        let ps_command = format!(
+            "Start-Process -FilePath '{}' -ArgumentList '{}','{}' -Verb RunAs -Wait -WindowStyle Hidden",
+            helper_path_str.replace('\'', "''"),
+            root_str.replace('\'', "''"),
+            tmp_str.replace('\'', "''"),
+        );
+
+        write_debug_log(&state, &format!(
+            "scan_directory_with_helper launching helper for root={}", root_str
+        ));
+
+        let _ = app_for_scan.emit("scan-progress", &cutest_disk_tree::ScanProgress {
+            files_count: 0,
+            current_path: None,
+            status: Some(format!("Waiting for MFT scan of {} (UAC prompt)…", root_str)),
+        });
+
+        let status = tauri::async_runtime::spawn_blocking({
+            let ps_command = ps_command.clone();
+            move || {
+                std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-WindowStyle", "Hidden",
+                        "-Command",
+                        &ps_command,
+                    ])
+                    .status()
+            }
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking failed: {}", e))?
+        .map_err(|e| format!("powershell failed to launch: {}", e))?;
+
+        if !status.success() {
+            write_debug_log(&state, &format!(
+                "scan_directory_with_helper: helper exited with code {:?} for root={}",
+                status.code(), root_str
+            ));
+            state.is_scanning.store(false, Ordering::SeqCst);
+            return Err(format!(
+                "mft-helper failed for {} (exit code {:?}). User may have cancelled the UAC prompt.",
+                root_str, status.code()
+            ));
+        }
+
+        // Read the JSON output the helper wrote.
+        let json_bytes = std::fs::read(&tmp_path)
+            .map_err(|e| format!("failed to read helper output for {}: {}", root_str, e))?;
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let output: MftScanOutput = serde_json::from_slice(&json_bytes)
+            .map_err(|e| format!("failed to parse helper JSON for {}: {}", root_str, e))?;
+
+        cutest_disk_tree::logging::debug_log::write_debug_log(&scan_log_path, &format!(
+            "scan_method: MFT scan via helper for {} files={} folders={}",
+            root_str, output.files.len(), output.folders.len()
+        ));
+
+        all_folder_strings.extend(output.folders);
+        all_mft_files.extend(output.files);
+    }
+
+    let _ = app_for_scan.emit("scan-progress", &cutest_disk_tree::ScanProgress {
+        files_count: all_mft_files.len() as u64,
+        current_path: None,
+        status: Some("Building index…".into()),
+    });
+
+    // Convert MftFileEntry → FileEntry for phase2.
+    let files_arc: Arc<Vec<cutest_disk_tree::FileEntry>> = Arc::new(
+        all_mft_files
+            .into_iter()
+            .map(|f| cutest_disk_tree::FileEntry {
+                path: std::path::PathBuf::from(&f.path),
+                size: f.size,
+                file_key: cutest_disk_tree::FileKey { dev: f.dev, ino: f.ino },
+                mtime: f.mtime,
+            })
+            .collect(),
+    );
+
+    let all_folder_paths: std::collections::HashSet<std::path::PathBuf> = all_folder_strings
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+
+    write_debug_log(&state, &format!(
+        "scan_directory_with_helper phase1_done files={} folders={} ms={}",
+        files_arc.len(), all_folder_paths.len(), scan_start.elapsed().as_millis(),
+    ));
+
+    let cancel_token = {
+        let mut guard = state.phase2_cancel.lock().unwrap();
+        guard.store(true, Ordering::Relaxed);
+        let fresh = Arc::new(AtomicBool::new(false));
+        *guard = fresh.clone();
+        fresh
+    };
+    {
+        let mut disk_guard = state.disk_objects.lock().unwrap();
+        *disk_guard = None;
+        let mut idx_guard = state.name_reverse_index.lock().unwrap();
+        *idx_guard = None;
+        let mut tri_guard = state.trigram_index.lock().unwrap();
+        *tri_guard = None;
+    }
+
+    let response = ScanDirectoryResponse {
+        roots: roots_str,
+        files_count: files_arc.len() as u64,
+        folders_count: all_folder_paths.len() as u64,
+    };
+
+    let app_bg = app.clone();
+    let files_bg = Arc::clone(&files_arc);
+    let roots_bg = scan_roots;
+    let folder_paths_bg = all_folder_paths;
+    let mode = state.index_mode;
+    tauri::async_runtime::spawn_blocking(move || {
+        run_phase2(app_bg, db_path, roots_bg, files_bg, folder_paths_bg, cancel_token, mode);
+    });
+
+    state.is_scanning.store(false, Ordering::SeqCst);
+    write_debug_log(&state, "scan_directory_with_helper done");
+    Ok(response)
+}
+
 #[tauri::command]
 async fn scan_directory(
     app: tauri::AppHandle,
@@ -738,11 +945,22 @@ async fn scan_directory(
     let app_for_scan = app.clone();
     let scan_start = Instant::now();
     let roots_for_scan = scan_roots.clone();
+    let scan_log_path = resolve_debug_log_path(&state);
     let (files_arc, all_folder_paths, roots_str) = match tauri::async_runtime::spawn_blocking(move || {
         let (files_arc, all_folders, roots_str) =
             cutest_disk_tree::core::scanning::ignore_scanner::scan_roots_with_ignore(
                 &roots_for_scan,
                 move |p| {
+                    // Write scan-method status messages to the debug log so it's
+                    // always clear whether we used the MFT or the directory walk.
+                    if let Some(ref status) = p.status {
+                        if status.contains("MFT") || status.contains("falling back") || status.contains("directory walk") {
+                            cutest_disk_tree::logging::debug_log::write_debug_log(
+                                &scan_log_path,
+                                &format!("scan_method: {}", status),
+                            );
+                        }
+                    }
                     let _ = app_for_scan.emit("scan-progress", &p);
                 },
             );
@@ -1827,6 +2045,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             scan_directory,
+            scan_directory_with_helper,
             load_cached_scan,
             list_cached_tree_depths,
             build_disk_tree_cached,

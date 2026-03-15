@@ -3,6 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import type { ScanDirectoryResponse, ScanProgress, FileSearchResult, FolderSizesReady } from "./types";
 import type { DiskTreeNode } from "./utils/diskTree";
 
+export const scanDirectoryWithHelper = (): Promise<ScanDirectoryResponse> =>
+  invoke("scan_directory_with_helper", {});
+
 export const buildDiskTreeCached = (
   startPath: string,
   maxChildrenPerNode: number,

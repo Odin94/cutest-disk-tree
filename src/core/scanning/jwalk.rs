@@ -20,20 +20,6 @@ where
         status: Some("Scanning files…".into()),
     });
 
-    #[cfg(windows)]
-    {
-        if let Some((files, folder_sizes)) =
-            crate::core::scanning::ntfs::index_directory_ntfs_with_progress(root, &mut progress)
-        {
-            return (files, folder_sizes);
-        }
-        progress(ScanProgress {
-            files_count: 0,
-            current_path: None,
-            status: Some("Falling back to directory walk…".into()),
-        });
-    }
-
     let (files, folder_sizes, _stats) =
         index_directory_parallel_jwalk_internal(root, progress, IndexMode::Full);
 

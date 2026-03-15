@@ -22,6 +22,9 @@ out/
 
 # Tauri
 src-tauri/target/
+
+# mft-helper
+mft-helper/target/
 src-tauri/WixTools/
 src-tauri/gen/
 release-out/

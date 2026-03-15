@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { Toaster } from "sonner";
-import { scanDirectory, onScanProgress, loadCachedScan, debugLog, onScanPhaseStatus, onScanFolderSizesReady } from "./api";
+import { scanDirectory, scanDirectoryWithHelper, onScanProgress, loadCachedScan, debugLog, onScanPhaseStatus, onScanFolderSizesReady } from "./api";
 import type { ScanResult, ScanProgress, FolderSizesReady, ScanDirectoryResponse } from "./types";
 import "./App.css";
 import { DiskUsageView } from "./views/DiskUsageView";
@@ -17,6 +17,7 @@ const App = () => {
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scanPhaseStatus, setScanPhaseStatus] = useState<string>("");
+  const [showElevationDialog, setShowElevationDialog] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
   const phaseStatusUnlistenRef = useRef<(() => void) | null>(null);
   const scanCancelRef = useRef(false);
@@ -25,15 +26,17 @@ const App = () => {
   const PROGRESS_LOG_INTERVAL_MS = 2000;
   const latestFolderSizesRef = useRef<FolderSizesReady | null>(null);
 
-  const runScan = async () => {
+  const executeScan = async (
+    invoker: () => Promise<ScanDirectoryResponse>,
+    label: string
+  ) => {
     if (scanInProgressRef.current) {
       const stack = new Error().stack ?? "(no stack)";
-      debugLog(`App runScan BLOCKED (already in progress) stack=${stack.split("\n").slice(0, 5).join(" | ")}`);
-      console.error("[runScan] BLOCKED - scan already in progress", stack);
+      debugLog(`App ${label} BLOCKED (already in progress) stack=${stack.split("\n").slice(0, 5).join(" | ")}`);
       return;
     }
     scanInProgressRef.current = true;
-    debugLog("App runScan initiated");
+    debugLog(`App ${label} initiated`);
     latestFolderSizesRef.current = null;
     setLoading(true);
     setProgress(null);
@@ -41,7 +44,6 @@ const App = () => {
     scanCancelRef.current = false;
     progressLogTimeRef.current = 0;
     try {
-      debugLog("App runScan: setting up progress listener");
       unlistenRef.current = await onScanProgress((p) => {
         setProgress(p);
         const now = Date.now();
@@ -51,11 +53,10 @@ const App = () => {
           debugLog(`App scan progress files=${p.files_count} current_path=${top.slice(-60)}`);
         }
       });
-      debugLog("App runScan: calling scanDirectory");
-      const summary: ScanDirectoryResponse = await scanDirectory();
-      debugLog(`App runScan: scanDirectory returned files_count=${summary.files_count} folders_count=${summary.folders_count}`);
+      const summary: ScanDirectoryResponse = await invoker();
+      debugLog(`App ${label}: returned files_count=${summary.files_count} folders_count=${summary.folders_count}`);
       if (scanCancelRef.current) {
-        debugLog("App runScan completed but was cancelled, ignoring result");
+        debugLog(`App ${label} completed but was cancelled, ignoring result`);
         return;
       }
       const scanResult: ScanResult = {
@@ -69,13 +70,13 @@ const App = () => {
       if (latestSizes !== null) {
         scanResult.folder_sizes = latestSizes.folder_sizes;
       }
-      debugLog(`App runScan done files_count=${summary.files_count}`);
+      debugLog(`App ${label} done files_count=${summary.files_count}`);
       setResult(scanResult);
       if (category !== "find") setCategory("find");
     } catch (e) {
       if (!scanCancelRef.current) {
         setError(e instanceof Error ? e.message : String(e));
-        debugLog(`App runScan error ${e instanceof Error ? e.message : String(e)}`);
+        debugLog(`App ${label} error ${e instanceof Error ? e.message : String(e)}`);
       }
     } finally {
       if (unlistenRef.current) {
@@ -85,8 +86,13 @@ const App = () => {
       scanInProgressRef.current = false;
       setLoading(false);
       setProgress(null);
-      debugLog("App runScan finally: cleanup done, scanInProgressRef=false");
+      debugLog(`App ${label} finally: cleanup done`);
     }
+  };
+
+  const runScan = () => {
+    if (scanInProgressRef.current) return;
+    setShowElevationDialog(true);
   };
 
   const cancelScan = () => {
@@ -166,11 +172,53 @@ const App = () => {
     });
   }, []);
 
+  const handleChooseFastScan = () => {
+    setShowElevationDialog(false);
+    executeScan(scanDirectoryWithHelper, "runScanFast");
+  };
+
+  const handleChooseSlowScan = () => {
+    setShowElevationDialog(false);
+    executeScan(scanDirectory, "runScanSlow");
+  };
+
   return (
     <div
       className={`app ${category === "disk" ? "app-dashboard-layout" : ""}`}
     >
       <Toaster />
+
+      {showElevationDialog && (
+        <div className="elevation-dialog-overlay">
+          <div className="elevation-dialog">
+            <h2 className="elevation-dialog-title">Choose scan speed</h2>
+            <p className="elevation-dialog-body">
+              Fast scanning reads the file system index directly (MFT) but
+              requires administrator rights. Slow scanning walks directories
+              without any special permissions.
+            </p>
+            <div className="elevation-dialog-actions">
+              <button
+                type="button"
+                className="elevation-dialog-btn elevation-dialog-btn-fast"
+                onClick={handleChooseFastScan}
+              >
+                Fast scan
+                <span className="elevation-dialog-btn-sub">runs as admin · triggers UAC prompt</span>
+              </button>
+              <button
+                type="button"
+                className="elevation-dialog-btn elevation-dialog-btn-slow"
+                onClick={handleChooseSlowScan}
+              >
+                Slow scan
+                <span className="elevation-dialog-btn-sub">no admin needed</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <TitleBar
         category={category}
         activeTab={activeTab}

@@ -457,8 +457,6 @@ pub use crate::core::scanning::jwalk::{
     index_directory_parallel_with_progress,
 };
 
-#[cfg(windows)]
-pub use crate::core::scanning::ntfs::index_directory_ntfs_with_progress;
 
 pub fn index_directory_serializable(root: &Path) -> Option<ScanResult> {
     let (files, folder_sizes) = index_directory(root);
@@ -496,6 +494,7 @@ pub use crate::core::scanning::lolcate::{
     index_directory_lolcate_full,
     index_directory_lolcate_like,
 };
+
 
 #[cfg(test)]
 mod tests;

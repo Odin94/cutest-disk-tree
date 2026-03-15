@@ -916,12 +916,40 @@ body {
         0 2px 8px hsl(var(--lavender) / 0.18);
 }
 
+.elevation-dialog-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
 .elevation-dialog-title {
     font-family: "Fredoka", sans-serif;
     font-size: 1.25rem;
     font-weight: 600;
     color: hsl(var(--foreground));
     margin: 0;
+}
+
+.elevation-dialog-close {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: hsl(var(--muted-foreground));
+    font-size: 0.85rem;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background 0.12s, color 0.12s;
+}
+
+.elevation-dialog-close:hover {
+    background: hsl(var(--muted));
+    color: hsl(var(--foreground));
 }
 
 .elevation-dialog-body {

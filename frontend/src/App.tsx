@@ -189,9 +189,19 @@ const App = () => {
       <Toaster />
 
       {showElevationDialog && (
-        <div className="elevation-dialog-overlay">
-          <div className="elevation-dialog">
-            <h2 className="elevation-dialog-title">Choose scan speed</h2>
+        <div className="elevation-dialog-overlay" onClick={() => setShowElevationDialog(false)}>
+          <div className="elevation-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="elevation-dialog-header">
+              <h2 className="elevation-dialog-title">Choose scan speed</h2>
+              <button
+                type="button"
+                className="elevation-dialog-close"
+                onClick={() => setShowElevationDialog(false)}
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
             <p className="elevation-dialog-body">
               Fast scanning reads the file system index directly (MFT) but
               requires administrator rights. Slow scanning walks directories

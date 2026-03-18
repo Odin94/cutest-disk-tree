@@ -13,7 +13,7 @@ import cozyBg from "../assets/cozy-bg.jpg";
 export type TabId = "find" | "folders";
 type FileCategory = "all" | "audio" | "document" | "video" | "image" | "executable" | "compressed" | "config" | "folder" | "other";
 
-export const MAX_VISIBLE_FILES = 500;
+export const MAX_VISIBLE_FILES = 100;
 
 type FileFindingViewProps = {
   result: ScanResult | null;
@@ -48,6 +48,7 @@ export const FileFindingView = ({ result, loading, error, progress, scanPhaseSta
     category: FileCategory;
     fuzzy: boolean;
   } | null>(null);
+  const searchGenRef = useRef(0);
 
   useEffect(() => {
     lastQueryRef.current = null;
@@ -99,23 +100,19 @@ export const FileFindingView = ({ result, loading, error, progress, scanPhaseSta
       ) {
         return;
       }
+      const gen = ++searchGenRef.current;
       setSearchLoading(true);
-      setSearchResults([]);
-      setSearchNextOffset(null);
       setSearchError(null);
-      const t0 = performance.now();
-      debugLog(`find_files invoke_start query_len=${searchQuery.length} category=${searchCategory}`);
       findFiles(searchQuery, extensions, searchCategory, useFuzzySearch, PAGE_SIZE, 0)
         .then((response) => {
-          const ipcMs = Math.round(performance.now() - t0);
-          debugLog(`find_files ipc_done ipc_total_ms=${ipcMs} items=${response.items.length} has_more=${response.nextOffset != null}`);
+          if (gen !== searchGenRef.current) return;
           lastQueryRef.current = queryKey;
           setSearchResults(response.items);
           setSearchNextOffset(response.nextOffset);
         })
-        .catch((e) => setSearchError(e instanceof Error ? e.message : String(e)))
-        .finally(() => setSearchLoading(false));
-    }, 200);
+        .catch((e) => { if (gen === searchGenRef.current) setSearchError(e instanceof Error ? e.message : String(e)); })
+        .finally(() => { if (gen === searchGenRef.current) setSearchLoading(false); });
+    }, 16);
     return () => window.clearTimeout(timeoutId);
   }, [activeTab, canSearch, searchQuery, searchExtensions, searchCategory, useFuzzySearch]);
 

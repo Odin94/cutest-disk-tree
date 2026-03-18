@@ -91,21 +91,23 @@ pub fn build_index(objects: &[DiskObject]) -> TrigramIndex {
     TrigramIndex { objects: objects.to_vec(), map }
 }
 
+/// Returns matching object indices (into `index.objects`) and whether more results exist.
+/// Callers build their result type directly from the index to avoid cloning full objects.
 pub fn find_files(
     index: &TrigramIndex,
     query: &str,
     _filter: &SearchFilter,
     limit: usize,
     offset: usize,
-) -> (Vec<DiskObject>, bool) {
+) -> (Vec<u32>, bool) {
     let query_lower = query.to_ascii_lowercase();
 
-    // Empty query: return a direct slice — no filtering needed
+    // Empty query: return a direct range — no filtering needed
     if query_lower.is_empty() {
         let has_more = index.objects.len() > offset + limit;
         let s = offset.min(index.objects.len());
         let e = (s + limit).min(index.objects.len());
-        return (index.objects[s..e].to_vec(), has_more);
+        return ((s..e).map(|i| i as u32).collect(), has_more);
     }
 
     let qb = query_lower.as_bytes();
@@ -125,10 +127,7 @@ pub fn find_files(
         let has_more = candidates.len() >= global_needed;
         let s = offset.min(candidates.len());
         let e = (s + limit).min(candidates.len());
-        return (
-            candidates[s..e].iter().map(|&i| index.objects[i as usize].clone()).collect(),
-            has_more,
-        );
+        return (candidates[s..e].to_vec(), has_more);
     }
 
     // Trigram query: collect unique query trigrams, look up posting lists, intersect
@@ -171,10 +170,7 @@ pub fn find_files(
     let has_more = candidates.len() > offset + limit;
     let s = offset.min(candidates.len());
     let e = (s + limit).min(candidates.len());
-    (
-        candidates[s..e].iter().map(|&i| index.objects[i as usize].clone()).collect(),
-        has_more,
-    )
+    (candidates[s..e].to_vec(), has_more)
 }
 
 // ── Backward-compatible stubs (used by the Tauri app's InMemoryNgrams mode) ─
@@ -208,13 +204,17 @@ mod tests {
         }
     }
 
+    fn names(idx: &TrigramIndex, indices: &[u32]) -> Vec<String> {
+        indices.iter().map(|&i| idx.objects[i as usize].name.clone()).collect()
+    }
+
     #[test]
     fn exact_substring_match() {
         let objs = vec![make_file("readme.md"), make_file("main.rs"), make_file("Cargo.toml")];
         let idx = build_index(&objs);
         let (results, _) = find_files(&idx, "main", &SearchFilter::None, 10, 0);
         assert_eq!(results.len(), 1);
-        assert!(results[0].name.contains("main"));
+        assert!(idx.objects[results[0] as usize].name.contains("main"));
     }
 
     #[test]
@@ -259,6 +259,6 @@ mod tests {
         let (page2, _) = find_files(&idx, "config", &SearchFilter::None, 2, 2);
         assert_eq!(page1.len(), 2);
         assert_eq!(page2.len(), 2);
-        assert_ne!(page1[0].name, page2[0].name);
+        assert_ne!(names(&idx, &page1)[0], names(&idx, &page2)[0]);
     }
 }

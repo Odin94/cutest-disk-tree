@@ -544,58 +544,33 @@ export const FileTable = ({
         ))}
       </div>
 
+      {searchLoading && (
+        <div className="h-0.5 overflow-hidden">
+          <div className="h-full bg-primary/50 animate-pulse w-full" />
+        </div>
+      )}
       <div ref={scrollRef} className="h-[60vh] overflow-y-auto overflow-x-hidden min-w-0">
-        <AnimatePresence mode="popLayout">
-          {searchLoading ? (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              className="flex flex-col items-center justify-center h-full text-muted-foreground"
-            >
-              <span className="text-4xl mb-3">🍂</span>
-              <p className="font-display text-lg">Searching…</p>
-            </motion.div>
-          ) : sorted.length === 0 ? (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              className="flex flex-col items-center justify-center h-full text-muted-foreground"
-            >
-              <span className="text-4xl mb-3">🍂</span>
-              <p className="font-display text-lg">No files found</p>
-              <p className="text-sm">Try adjusting your search or filters</p>
-            </motion.div>
-          ) : visibleFiles.length > 200 ? (
-            <AnimatePresence mode="wait">
-              <motion.div
-                key={`${sortField}-${sortDir}`}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.2 }}
-              >
-                {visibleFiles.map((file, i) => (
-                  <FileRow
-                    key={`${file.path}:${file.file_key?.dev ?? "d"}:${file.file_key?.ino ?? "i"}`}
-                    file={file}
-                    index={i}
-                    query={query}
-                    useSimpleAnimation
-                  />
-                ))}
-              </motion.div>
-            </AnimatePresence>
-          ) : (
-            visibleFiles.map((file, i) => (
-              <FileRow
-                key={`${file.path}:${file.file_key?.dev ?? "d"}:${file.file_key?.ino ?? "i"}`}
-                file={file}
-                index={i}
-                query={query}
-              />
-            ))
-          )}
-        </AnimatePresence>
+        {!searchLoading && sorted.length === 0 ? (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="flex flex-col items-center justify-center h-full text-muted-foreground"
+          >
+            <span className="text-4xl mb-3">🍂</span>
+            <p className="font-display text-lg">No files found</p>
+            <p className="text-sm">Try adjusting your search or filters</p>
+          </motion.div>
+        ) : (
+          visibleFiles.map((file, i) => (
+            <FileRow
+              key={`${file.path}:${file.file_key?.dev ?? "d"}:${file.file_key?.ino ?? "i"}`}
+              file={file}
+              index={i}
+              query={query}
+              useSimpleAnimation
+            />
+          ))
+        )}
 
         {loadingMore && !searchLoading ? <LoadingSpinner /> : null}
         <div ref={sentinelRef} className="h-1" />

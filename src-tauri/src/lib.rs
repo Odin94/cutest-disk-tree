@@ -99,7 +99,7 @@ mod category_filter {
             }
             _ => {
                 if matches!(obj.kind, DiskObjectKind::Folder) {
-                    return true;
+                    return false;
                 }
                 let set = match extension_set(category) {
                     Some(s) => s,

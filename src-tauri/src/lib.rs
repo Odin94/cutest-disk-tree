@@ -719,6 +719,11 @@ struct MftScanOutput {
     folders: Vec<String>,
 }
 
+#[tauri::command]
+fn get_scan_status(state: tauri::State<'_, AppState>) -> bool {
+    state.is_scanning.load(Ordering::SeqCst)
+}
+
 /// Run a fast MFT scan by launching the `mft-helper` binary with UAC elevation
 /// via PowerShell `Start-Process -Verb RunAs -Wait`. The helper writes JSON to
 /// a temp file; we read it back and proceed exactly like `scan_directory`.
@@ -906,6 +911,7 @@ async fn scan_directory_with_helper(
     });
 
     state.is_scanning.store(false, Ordering::SeqCst);
+    let _ = app.emit("scan-complete", &response);
     write_debug_log(&state, "scan_directory_with_helper done");
     Ok(response)
 }
@@ -1016,6 +1022,7 @@ async fn scan_directory(
     });
 
     state.is_scanning.store(false, Ordering::SeqCst);
+    let _ = app.emit("scan-complete", &response);
     write_debug_log(&state, "scan_directory done");
     Ok(response)
 }
@@ -2039,6 +2046,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_directory,
             scan_directory_with_helper,
+            get_scan_status,
             load_cached_scan,
             list_cached_tree_depths,
             build_disk_tree_cached,

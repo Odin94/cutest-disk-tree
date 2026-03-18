@@ -35,6 +35,16 @@ export const scanDirectory = (): Promise<ScanDirectoryResponse> => {
   return invoke("scan_directory", {});
 };
 
+export const getScanStatus = (): Promise<boolean> =>
+  invoke("get_scan_status", {});
+
+export const onScanComplete = (callback: (response: ScanDirectoryResponse) => void) => {
+  const unlisten = listen<ScanDirectoryResponse>("scan-complete", (event) => {
+    callback(event.payload);
+  });
+  return unlisten;
+};
+
 export const onScanProgress = (callback: (progress: ScanProgress) => void) => {
   const unlisten = listen<ScanProgress>("scan-progress", (event) => {
     callback(event.payload);

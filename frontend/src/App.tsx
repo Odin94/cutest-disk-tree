@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { Toaster } from "sonner";
-import { scanDirectory, scanDirectoryWithHelper, onScanProgress, loadCachedScan, debugLog, onScanPhaseStatus, onScanFolderSizesReady } from "./api";
+import { scanDirectory, scanDirectoryWithHelper, onScanProgress, onScanComplete, getScanStatus, loadCachedScan, debugLog, onScanPhaseStatus, onScanFolderSizesReady } from "./api";
 import type { ScanResult, ScanProgress, FolderSizesReady, ScanDirectoryResponse } from "./types";
 import "./App.css";
 import { DiskUsageView } from "./views/DiskUsageView";
@@ -22,6 +22,7 @@ const App = () => {
   const phaseStatusUnlistenRef = useRef<(() => void) | null>(null);
   const scanCancelRef = useRef(false);
   const scanInProgressRef = useRef(false);
+  const observingScanRef = useRef(false);
   const progressLogTimeRef = useRef(0);
   const PROGRESS_LOG_INTERVAL_MS = 2000;
   const latestFolderSizesRef = useRef<FolderSizesReady | null>(null);
@@ -74,11 +75,23 @@ const App = () => {
       setResult(scanResult);
       if (category !== "find") setCategory("find");
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg === "A scan is already in progress") {
+        debugLog(`App ${label} scan already in progress, entering observer mode`);
+        observingScanRef.current = true;
+        // Stay in loading state — scan-complete event will finish cleanup
+        return;
+      }
       if (!scanCancelRef.current) {
-        setError(e instanceof Error ? e.message : String(e));
-        debugLog(`App ${label} error ${e instanceof Error ? e.message : String(e)}`);
+        setError(msg);
+        debugLog(`App ${label} error ${msg}`);
       }
     } finally {
+      if (observingScanRef.current) {
+        // Observer mode: scan-complete handler is responsible for cleanup
+        debugLog(`App ${label} finally: observer mode, skipping cleanup`);
+        return;
+      }
       if (unlistenRef.current) {
         unlistenRef.current();
         unlistenRef.current = null;
@@ -150,6 +163,50 @@ const App = () => {
       isMounted = false;
       if (unlisten !== null) unlisten();
     };
+  }, []);
+
+  // Listen for scan-complete to handle observer mode (scan started before/outside this session)
+  useEffect(() => {
+    let isMounted = true;
+    onScanComplete((summary) => {
+      if (!isMounted || !observingScanRef.current) return;
+      debugLog(`App scan-complete observer: files_count=${summary.files_count}`);
+      observingScanRef.current = false;
+      scanInProgressRef.current = false;
+      if (unlistenRef.current) {
+        unlistenRef.current();
+        unlistenRef.current = null;
+      }
+      setLoading(false);
+      setProgress(null);
+      setResult({
+        roots: summary.roots,
+        files: [],
+        folder_sizes: latestFolderSizesRef.current?.folder_sizes ?? {},
+        files_count: summary.files_count,
+        folders_count: summary.folders_count,
+      });
+    }).then((unlisten) => {
+      if (!isMounted) unlisten();
+    });
+    return () => { isMounted = false; };
+  }, []);
+
+  // On startup, check if a scan is already in progress and show loading UI
+  useEffect(() => {
+    getScanStatus().then((isScanning) => {
+      if (isScanning) {
+        debugLog("App mount: scan already in progress, entering observer mode");
+        observingScanRef.current = true;
+        scanInProgressRef.current = true;
+        setLoading(true);
+        onScanProgress((p) => setProgress(p)).then((fn) => {
+          unlistenRef.current = fn;
+        });
+      }
+    }).catch((e) => {
+      debugLog(`App getScanStatus error: ${e instanceof Error ? e.message : String(e)}`);
+    });
   }, []);
 
   useEffect(() => {

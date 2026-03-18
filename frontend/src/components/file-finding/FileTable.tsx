@@ -243,11 +243,16 @@ const FileRow = ({ file, index, query, useSimpleAnimation = false }: FileRowProp
     setMenuOpen((prev) => !prev);
   };
 
+  const handleDoubleClick = async () => {
+    await revealItemInDir(file.path);
+    toast.success(`Opening ${getParentPath(file.path)}`);
+  };
+
   const rowClassName =
     "relative flex items-center gap-2 px-5 py-3 hover:bg-muted/40 transition-colors duration-200 border-b border-border/30 last:border-b-0 group cursor-default select-text";
 
   return useSimpleAnimation ? (
-    <div onContextMenu={handleContextMenu} className={rowClassName}>
+    <div onContextMenu={handleContextMenu} onDoubleClick={handleDoubleClick} className={rowClassName}>
       <div className="flex-[3] min-w-0 flex items-center gap-3">
         <div
           className={`w-8 h-8 rounded-lg flex items-center justify-center ${colorCls} transition-transform group-hover:scale-110`}
@@ -335,6 +340,7 @@ const FileRow = ({ file, index, query, useSimpleAnimation = false }: FileRowProp
       exit={{ opacity: 0, x: 6 }}
       transition={{ duration: 0.18, delay: index * 0.015 }}
       onContextMenu={handleContextMenu}
+      onDoubleClick={handleDoubleClick}
       className={rowClassName}
     >
       <div className="flex-[3] min-w-0 flex items-center gap-3">

@@ -1410,7 +1410,7 @@ fn find_files_in_memory(
                     .as_ref()
                     .map(|t| set.contains(t))
                     .unwrap_or(false),
-                DiskObjectKind::Folder => true,
+                DiskObjectKind::Folder => false,
             };
             if allowed {
                 count += 1;
@@ -1630,7 +1630,7 @@ fn find_files_in_ngram_index(
         if let Some(ref set) = extension_set {
             match o.kind {
                 DiskObjectKind::File => o.ext.as_ref().map(|e| set.contains(e)).unwrap_or(false),
-                DiskObjectKind::Folder => true,
+                DiskObjectKind::Folder => false,
             }
         } else {
             category_filter::category_allowed(category.as_deref(), o)

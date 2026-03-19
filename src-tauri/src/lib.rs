@@ -1607,18 +1607,49 @@ fn find_files_in_memory(
     }
 }
 
+fn nucleo_rank_objects(query: &str, candidates: Vec<&DiskObject>, limit: usize) -> Vec<SearchEntry> {
+    let labels: Vec<&str> = candidates.iter().map(|o| o.name.as_str()).collect();
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut scored = pattern.match_list(labels.iter().copied(), &mut matcher);
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    let label_to_idx: HashMap<*const str, usize> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, o)| (o.name.as_str() as *const str, i))
+        .collect();
+    let mut seen: HashSet<usize> = HashSet::new();
+    scored
+        .into_iter()
+        .take(limit)
+        .filter_map(|(label, _)| {
+            let ptr = label as *const str;
+            label_to_idx.get(&ptr).and_then(|&i| {
+                if seen.insert(i) {
+                    Some(search_entry_from_disk_object(candidates[i]))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
 fn find_files_in_ngram_index(
     state: &tauri::State<AppState>,
     query: String,
     extensions: Option<String>,
     category: Option<String>,
     limit: Option<u32>,
-    _use_fuzzy: Option<bool>,
+    use_fuzzy: Option<bool>,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
     const DEFAULT_LIMIT: u32 = 500;
     let limit = limit.unwrap_or(DEFAULT_LIMIT) as usize;
     let offset = offset.unwrap_or(0) as usize;
+    let q_trimmed = query.trim();
+    let q_len = q_trimmed.chars().count();
+    let apply_fuzzy = use_fuzzy.unwrap_or(true) && !q_trimmed.is_empty() && q_len >= 3;
     let total_start = Instant::now();
 
     let guard = state.trigram_index.lock().unwrap();
@@ -1710,38 +1741,61 @@ fn find_files_in_ngram_index(
                 cat_set.extend(ext_matches);
             }
 
-            // Step 2: collect all object indices whose filename contains the query
-            let (query_matches, _) = trigram_find_files(
-                &index_arc,
-                &query,
-                &SearchFilter::None,
-                usize::MAX,
-                0,
-            );
-
+            if apply_fuzzy {
+                // Fuzzy: skip trigram query filter — nucleo scores all ext-matching candidates.
+                let search_ms = search_start.elapsed().as_millis();
+                write_debug_log(state, &format!(
+                    "find_files_in_ngram_index ext_search mode=fuzzy query={:?} cat_candidates={} ms={}",
+                    query, cat_set.len(), search_ms,
+                ));
+                let mut cat_sorted: Vec<u32> = cat_set.into_iter().collect();
+                cat_sorted.sort_unstable();
+                let candidates: Vec<&DiskObject> = cat_sorted.iter()
+                    .map(|&i| &index_arc.objects[i as usize])
+                    .collect();
+                let items = nucleo_rank_objects(&query, candidates, limit);
+                (items, None)
+            } else {
+                // Exact: Step 2 — intersect with trigram results for the query.
+                let (query_matches, _) = trigram_find_files(
+                    &index_arc,
+                    &query,
+                    &SearchFilter::None,
+                    usize::MAX,
+                    0,
+                );
+                let search_ms = search_start.elapsed().as_millis();
+                write_debug_log(state, &format!(
+                    "find_files_in_ngram_index ext_search mode=exact query={:?} cat_candidates={} query_candidates={} ms={}",
+                    query, cat_set.len(), query_matches.len(), search_ms,
+                ));
+                let query_set: HashSet<u32> = query_matches.into_iter().collect();
+                let mut combined: Vec<u32> = cat_set.into_iter()
+                    .filter(|idx| query_set.contains(idx))
+                    .collect();
+                combined.sort_unstable();
+                let s = offset.min(combined.len());
+                let e = (s + limit).min(combined.len());
+                let next_off = if e < combined.len() { Some(offset + limit) } else { None };
+                let items: Vec<SearchEntry> = combined[s..e].iter()
+                    .map(|&i| search_entry_from_disk_object(&index_arc.objects[i as usize]))
+                    .collect();
+                (items, next_off)
+            }
+        } else if apply_fuzzy {
+            // Fuzzy, folder/other — scan all objects, post-filter by category, then nucleo.
             let search_ms = search_start.elapsed().as_millis();
+            let candidates: Vec<&DiskObject> = index_arc.objects.iter()
+                .filter(|o| passes_filter(o))
+                .collect();
             write_debug_log(state, &format!(
-                "find_files_in_ngram_index ext_search cat_candidates={} query_candidates={} ms={}",
-                cat_set.len(), query_matches.len(), search_ms,
+                "find_files_in_ngram_index category_scan mode=fuzzy query={:?} candidates={} ms={}",
+                query, candidates.len(), search_ms,
             ));
-
-            // Step 3: intersect — retain only indices present in both sets, sorted by
-            // object index so results stay in a stable order.
-            let query_set: HashSet<u32> = query_matches.into_iter().collect();
-            let mut combined: Vec<u32> = cat_set.into_iter()
-                .filter(|idx| query_set.contains(idx))
-                .collect();
-            combined.sort_unstable();
-
-            let s = offset.min(combined.len());
-            let e = (s + limit).min(combined.len());
-            let next_off = if e < combined.len() { Some(offset + limit) } else { None };
-            let items: Vec<SearchEntry> = combined[s..e].iter()
-                .map(|&i| search_entry_from_disk_object(&index_arc.objects[i as usize]))
-                .collect();
-            (items, next_off)
+            let items = nucleo_rank_objects(&query, candidates, limit);
+            (items, None)
         } else {
-            // "folder" or "other" — no extension set to search; overfetch and post-filter.
+            // Exact, folder/other — overfetch from trigram index and post-filter.
             let fetch_limit = (limit * 4).max(2000);
             let (indices, _) = trigram_find_files(
                 &index_arc,
@@ -1752,8 +1806,8 @@ fn find_files_in_ngram_index(
             );
             let search_ms = search_start.elapsed().as_millis();
             write_debug_log(state, &format!(
-                "find_files_in_ngram_index trigram_search ms={} candidates={}",
-                search_ms, indices.len(),
+                "find_files_in_ngram_index trigram_search mode=exact query={:?} candidates={} ms={}",
+                query, indices.len(), search_ms,
             ));
             let filtered: Vec<SearchEntry> = indices.iter()
                 .map(|&i| &index_arc.objects[i as usize])
@@ -1763,8 +1817,19 @@ fn find_files_in_ngram_index(
                 .collect();
             (filtered, None)
         }
+    } else if apply_fuzzy {
+        // No filter, fuzzy — scan all objects and let nucleo rank them.
+        let search_start = Instant::now();
+        let candidates: Vec<&DiskObject> = index_arc.objects.iter().collect();
+        let search_ms = search_start.elapsed().as_millis();
+        write_debug_log(state, &format!(
+            "find_files_in_ngram_index full_scan mode=fuzzy query={:?} candidates={} ms={}",
+            query, candidates.len(), search_ms,
+        ));
+        let items = nucleo_rank_objects(&query, candidates, limit);
+        (items, None)
     } else {
-        // No filter — plain trigram search with pagination.
+        // No filter, exact — trigram search with pagination.
         let search_start = Instant::now();
         let (indices, has_more_raw) = trigram_find_files(
             &index_arc,
@@ -1775,8 +1840,8 @@ fn find_files_in_ngram_index(
         );
         let search_ms = search_start.elapsed().as_millis();
         write_debug_log(state, &format!(
-            "find_files_in_ngram_index trigram_search ms={} candidates={}",
-            search_ms, indices.len(),
+            "find_files_in_ngram_index trigram_search mode=exact query={:?} candidates={} ms={}",
+            query, indices.len(), search_ms,
         ));
         let items: Vec<SearchEntry> = indices.iter()
             .map(|&i| search_entry_from_disk_object(&index_arc.objects[i as usize]))
@@ -1788,8 +1853,9 @@ fn find_files_in_ngram_index(
 
     let total_ms = total_start.elapsed().as_millis();
     write_debug_log(state, &format!(
-        "find_files filter_ms={} total_ms={} count={} query_len={}",
-        filter_ms, total_ms, items.len(), query.len(),
+        "find_files mode={} filter_ms={} total_ms={} count={} query={:?}",
+        if apply_fuzzy { "fuzzy" } else { "exact" },
+        filter_ms, total_ms, items.len(), query,
     ));
 
     Ok(FindFilesResponse { items, next_offset })

@@ -100,3 +100,74 @@ fn get_filesystem_roots_returns_at_least_one() {
         assert!(root.exists(), "root {:?} should exist on disk", root);
     }
 }
+
+// ── nucleo_rank_objects tests ────────────────────────────────────────────────
+
+#[test]
+fn nucleo_rank_objects_matches_subsequence_not_substring() {
+    // "ntes" is a subsequence of "notes" but not a substring — this is the kind
+    // of query that the trigram pre-filter would drop (0 candidates), but nucleo
+    // should still find the match.
+    let objs = vec![
+        make_file("notes.txt", 1),
+        make_file("random.txt", 2),
+        make_file("unrelated.txt", 3),
+    ];
+    let candidates: Vec<&DiskObject> = objs.iter().collect();
+    let results = nucleo_rank_objects("ntes", candidates, 10);
+    let paths: Vec<&str> = results.iter().map(|e| e.path.as_str()).collect();
+    assert!(
+        paths.contains(&"C:/root/notes.txt"),
+        "nucleo should fuzzy-match 'ntes' to 'notes.txt', got: {:?}",
+        paths
+    );
+}
+
+#[test]
+fn nucleo_rank_objects_better_match_ranks_higher() {
+    // "note" is a stronger match for "notes.txt" than for "annotate.txt"
+    // (prefix match vs mid-word). Both contain "note" as a substring, but
+    // nucleo should score the closer match higher.
+    let objs = vec![
+        make_file("annotate.txt", 1),
+        make_file("notes.txt", 2),
+    ];
+    let candidates: Vec<&DiskObject> = objs.iter().collect();
+    let results = nucleo_rank_objects("notes", candidates, 10);
+    assert!(!results.is_empty(), "should have results");
+    assert_eq!(
+        results[0].path, "C:/root/notes.txt",
+        "exact name match should rank first, got: {:?}",
+        results.iter().map(|e| &e.path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn nucleo_rank_objects_respects_limit() {
+    let objs: Vec<DiskObject> = (0..20).map(|i| make_file(&format!("file{}.txt", i), i)).collect();
+    let candidates: Vec<&DiskObject> = objs.iter().collect();
+    let results = nucleo_rank_objects("file", candidates, 5);
+    assert_eq!(results.len(), 5);
+}
+
+#[test]
+fn nucleo_rank_objects_empty_candidates_returns_empty() {
+    let results = nucleo_rank_objects("anything", vec![], 10);
+    assert!(results.is_empty());
+}
+
+#[test]
+fn nucleo_rank_objects_case_insensitive() {
+    let objs = vec![
+        make_file("README.md", 1),
+        make_file("unrelated.txt", 2),
+    ];
+    let candidates: Vec<&DiskObject> = objs.iter().collect();
+    let results = nucleo_rank_objects("readme", candidates, 10);
+    let paths: Vec<&str> = results.iter().map(|e| e.path.as_str()).collect();
+    assert!(
+        paths.contains(&"C:/root/README.md"),
+        "nucleo should match 'readme' to 'README.md' case-insensitively, got: {:?}",
+        paths
+    );
+}

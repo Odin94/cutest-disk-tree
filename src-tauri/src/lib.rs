@@ -7,6 +7,7 @@ use cutest_disk_tree::core::indexing::compressed_text_index::{
 use cutest_disk_tree::core::indexing::ngram::{
     build_index as trigram_build_index, find_files as trigram_find_files, TrigramIndex,
 };
+use cutest_disk_tree::core::file_updating::{IndexWatcher, IndexReconciler};
 use cutest_disk_tree::core::indexing::suffix::{
     SuffixIndex, build_index as suffix_build_index, find_files as suffix_find_files,
 };
@@ -237,11 +238,13 @@ struct AppState {
     debug_log: Mutex<Option<std::path::PathBuf>>,
     disk_objects: Mutex<Option<Arc<Vec<DiskObject>>>>,
     name_reverse_index: Mutex<Option<Arc<SuffixIndex>>>,
-    trigram_index: Mutex<Option<Arc<TrigramIndex>>>,
+    trigram_index: Arc<Mutex<TrigramIndex>>,
     phase2_cancel: Mutex<Arc<AtomicBool>>,
-    is_scanning: AtomicBool,
+    is_scanning: Arc<AtomicBool>,
     scan_path_override: Option<String>,
     index_mode: SearchIndexMode,
+    _watcher: Mutex<Option<IndexWatcher>>,
+    _reconciler: Mutex<Option<IndexReconciler>>,
 }
 
 fn resolve_debug_log_path(state: &AppState) -> std::path::PathBuf {
@@ -260,6 +263,17 @@ fn resolve_debug_log_path(state: &AppState) -> std::path::PathBuf {
 fn write_debug_log(state: &AppState, message: &str) {
     let path = resolve_debug_log_path(state);
     cutest_disk_tree::logging::debug_log::write_debug_log(&path, message);
+}
+
+fn start_file_watchers(state: &AppState, roots: Vec<std::path::PathBuf>) {
+    let index = Arc::clone(&state.trigram_index);
+    let scan_flag = Arc::clone(&state.is_scanning);
+    match IndexWatcher::new(Arc::clone(&index), roots.clone()) {
+        Ok(w) => { *state._watcher.lock().unwrap() = Some(w); }
+        Err(e) => { write_debug_log(state, &format!("start_file_watchers: watcher error: {:?}", e)); }
+    }
+    *state._reconciler.lock().unwrap() = Some(IndexReconciler::new(index, roots, scan_flag));
+    write_debug_log(state, "start_file_watchers: watcher and reconciler started");
 }
 
 #[tauri::command]
@@ -444,8 +458,7 @@ fn activate_initial_index(
             {
                 let mut disk_guard = state.disk_objects.lock().unwrap();
                 *disk_guard = Some(Arc::new(objs));
-                let mut idx_guard = state.trigram_index.lock().unwrap();
-                *idx_guard = Some(Arc::new(index));
+                *state.trigram_index.lock().unwrap() = index;
             }
         }
         _ => {
@@ -569,9 +582,13 @@ fn run_phase2(
                     "phase2 trigram_rebuild done ms={} total_ms={}",
                     rebuild_ms, total_start.elapsed().as_millis(),
                 ));
-                *state_ptr.trigram_index.lock().unwrap() = Some(Arc::new(new_index));
+                *state_ptr.trigram_index.lock().unwrap() = new_index;
             }
         }
+    }
+
+    if mode == SearchIndexMode::InMemoryNgrams && !cancel.load(Ordering::Relaxed) {
+        start_file_watchers(&state_ptr, scan_roots.clone());
     }
 
     write_debug_log(&state_ptr, "phase2 emitting folder sizes to frontend");
@@ -891,8 +908,7 @@ async fn scan_directory_with_helper(
         *disk_guard = None;
         let mut idx_guard = state.name_reverse_index.lock().unwrap();
         *idx_guard = None;
-        let mut tri_guard = state.trigram_index.lock().unwrap();
-        *tri_guard = None;
+        *state.trigram_index.lock().unwrap() = trigram_build_index(&[]);
     }
 
     let response = ScanDirectoryResponse {
@@ -1003,8 +1019,7 @@ async fn scan_directory(
         *disk_guard = None;
         let mut idx_guard = state.name_reverse_index.lock().unwrap();
         *idx_guard = None;
-        let mut tri_guard = state.trigram_index.lock().unwrap();
-        *tri_guard = None;
+        *state.trigram_index.lock().unwrap() = trigram_build_index(&[]);
     }
     let response = ScanDirectoryResponse {
         roots: roots_str,
@@ -1318,7 +1333,7 @@ fn find_files(
         SearchIndexMode::CompressedText => find_files_in_compressed_text_index(&state, query, extensions, category, limit, use_fuzzy, offset),
         SearchIndexMode::Sqlite => find_files_in_db(&state, query, extensions, category, limit, use_fuzzy, offset),
         SearchIndexMode::InMemoryNgrams => {
-            let has_index = state.trigram_index.lock().unwrap().is_some();
+            let has_index = !state.trigram_index.lock().unwrap().objects.is_empty();
             if has_index {
                 find_files_in_ngram_index(&state, query, extensions, category, limit, use_fuzzy, offset)
             } else {
@@ -1606,13 +1621,11 @@ fn find_files_in_ngram_index(
     let offset = offset.unwrap_or(0) as usize;
     let total_start = Instant::now();
 
-    let index_arc = {
-        let guard = state.trigram_index.lock().unwrap();
-        match guard.as_ref() {
-            Some(idx) => idx.clone(),
-            None => return Ok(FindFilesResponse { items: vec![], next_offset: None }),
-        }
-    };
+    let guard = state.trigram_index.lock().unwrap();
+    let index_arc = &*guard;
+    if index_arc.objects.is_empty() {
+        return Ok(FindFilesResponse { items: vec![], next_offset: None });
+    }
 
     let has_filter = extensions.as_ref().map_or(false, |s| !s.trim().is_empty())
         || category.as_deref().map_or(false, |c| !c.trim().is_empty() && c.trim() != "all");
@@ -2008,6 +2021,8 @@ pub fn run() {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| path.join("debug.log"));
 
+            cutest_disk_tree::logging::debug_log::init_debug_logger(debug_log_path.clone());
+
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -2047,11 +2062,13 @@ pub fn run() {
                 debug_log: Mutex::new(Some(debug_log_path)),
                 disk_objects: Mutex::new(None),
                 name_reverse_index: Mutex::new(None),
-                trigram_index: Mutex::new(None),
+                trigram_index: Arc::new(Mutex::new(trigram_build_index(&[]))),
                 phase2_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
-                is_scanning: AtomicBool::new(false),
+                is_scanning: Arc::new(AtomicBool::new(false)),
                 scan_path_override: scan_path_override.clone(),
                 index_mode,
+                _watcher: Mutex::new(None),
+                _reconciler: Mutex::new(None),
             });
 
             let handle = app.handle().clone();
@@ -2089,7 +2106,7 @@ pub fn run() {
                                     "startup trigram_index objects={} ms={}",
                                     objs.len(), t0.elapsed().as_millis(),
                                 );
-                                Ok(Some((Arc::new(objs), None::<Arc<SuffixIndex>>, Some(Arc::new(index)))))
+                                Ok(Some((Arc::new(objs), None::<Arc<SuffixIndex>>, Some(index))))
                             } else {
                                 // InMemorySuffix: load from DB if available, rebuild otherwise
                                 let t_suffix = Instant::now();
@@ -2129,14 +2146,21 @@ pub fn run() {
                                     "startup suffix_index objects={} source={} ms={}",
                                     objs.len(), index_source, t_suffix.elapsed().as_millis(),
                                 );
-                                Ok(Some((Arc::new(objs), Some(Arc::new(name_index)), None::<Arc<TrigramIndex>>)))
+                                Ok(Some((Arc::new(objs), Some(Arc::new(name_index)), None::<TrigramIndex>)))
                             }
                         }).await;
 
                         if let Ok(Ok(Some((objs, name_idx, trigram_idx)))) = result {
                             *state.disk_objects.lock().unwrap() = Some(objs);
                             *state.name_reverse_index.lock().unwrap() = name_idx;
-                            *state.trigram_index.lock().unwrap() = trigram_idx;
+                            if let Some(ti) = trigram_idx {
+                                *state.trigram_index.lock().unwrap() = ti;
+                                let roots = match &state.scan_path_override {
+                                    Some(p) => vec![std::path::PathBuf::from(p)],
+                                    None => cutest_disk_tree::get_filesystem_roots(),
+                                };
+                                start_file_watchers(&state, roots);
+                            }
                             write_debug_log(&state, "setup: background index load complete");
                         }
                     });

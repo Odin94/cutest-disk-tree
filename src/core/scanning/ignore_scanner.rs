@@ -13,14 +13,14 @@ const VENV_DIR: &str = ".venv";
 
 // TODOdin: are we sure we want to ignore these?
 // They're at least relevant for the space-cleaning part of this app
-fn is_dependencies_dir(path: &Path) -> bool {
+pub(crate) fn is_dependencies_dir(path: &Path) -> bool {
     path.file_name()
         .map(|n| n == NODE_MODULES || n == VENV_DIR)
         .unwrap_or(false)
 }
 
 #[cfg(unix)]
-fn is_virtual_fs(path: &Path) -> bool {
+pub(crate) fn is_virtual_fs(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
     let s = path_str.as_ref();
     s == "/proc"
@@ -38,7 +38,7 @@ fn is_virtual_fs(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_virtual_fs(_path: &Path) -> bool {
+pub(crate) fn is_virtual_fs(_path: &Path) -> bool {
     false
 }
 

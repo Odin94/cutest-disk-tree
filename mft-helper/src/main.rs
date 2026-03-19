@@ -10,6 +10,39 @@ pub mod ntfs;
 ///   1  wrong argument count
 ///   2  MFT scan failed (non-NTFS, insufficient privileges, …)
 ///   3  failed to serialise / write output file
+///
+/// # TODO: incremental USN journal updates
+///
+/// The current implementation does a full MFT scan every time.  On Windows,
+/// `usn_journal_rs::journal::UsnJournal` exposes `read_entries_since(usn: u64)`
+/// which returns only the records that changed after a given USN (Update Sequence
+/// Number).  This enables incremental updates: on startup do a full MFT scan and
+/// record the current USN; on subsequent runs call `read_entries_since(last_usn)`
+/// to get only the delta, then apply `TrigramIndex::add` / `TrigramIndex::remove`
+/// for each record.
+///
+/// The USN to resume from should be persisted (e.g. next to the output file or in
+/// the app's cache directory) so the incremental path survives process restarts.
+///
+/// This would make the index watcher effectively zero-cost between rescans on NTFS
+/// volumes, replacing the `notify`-based `IndexWatcher` on Windows.
+///
+/// # TODO: background periodic directory walk (non-NTFS / low-privilege fallback)
+///
+/// When MFT access is unavailable (non-NTFS, non-admin), the `IndexWatcher` in
+/// `src/core/indexing/watcher.rs` uses `notify` for real-time events.  As a
+/// belt-and-suspenders measure, add a periodic lightweight walk that runs in the
+/// background on a low-priority thread (e.g. every 5–15 minutes) to catch any
+/// events that the OS watcher may have missed.
+///
+/// Implementation sketch:
+///   - Use `std::thread::Builder::new().stack_size(…).spawn(…)` with a loop +
+///     `std::thread::sleep(INTERVAL)` to keep resource usage minimal.
+///   - Walk with `jwalk::WalkDir::new(root).parallelism(jwalk::Parallelism::Serial)`
+///     (single thread, no rayon overhead) collecting (path, mtime) pairs.
+///   - Diff against the current index snapshot: call `index.add` for new paths,
+///     `index.remove` for gone paths, and skip unchanged entries.
+///   - Trigger a `compact()` at the end of each walk if the tombstone ratio is high.
 
 use serde::{Deserialize, Serialize};
 

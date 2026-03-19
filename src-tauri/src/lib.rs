@@ -1326,7 +1326,7 @@ fn find_files(
     extensions: Option<String>,
     category: Option<String>,
     limit: Option<u32>,
-    use_fuzzy: Option<bool>,
+    use_fuzzy: bool,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
     match state.index_mode {
@@ -1357,12 +1357,11 @@ fn find_files_in_memory(
     extensions: Option<String>,
     category: Option<String>,
     limit: Option<u32>,
-    use_fuzzy: Option<bool>,
+    use_fuzzy: bool,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
     const DEFAULT_LIMIT: u32 = 500;
     let limit = limit.unwrap_or(DEFAULT_LIMIT) as usize;
-    let use_fuzzy = use_fuzzy.unwrap_or(true);
     let start_index: usize = offset.unwrap_or(0) as usize;
     let total_start = Instant::now();
 
@@ -1641,7 +1640,7 @@ fn find_files_in_ngram_index(
     extensions: Option<String>,
     category: Option<String>,
     limit: Option<u32>,
-    use_fuzzy: Option<bool>,
+    use_fuzzy: bool,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
     const DEFAULT_LIMIT: u32 = 500;
@@ -1649,7 +1648,7 @@ fn find_files_in_ngram_index(
     let offset = offset.unwrap_or(0) as usize;
     let q_trimmed = query.trim();
     let q_len = q_trimmed.chars().count();
-    let apply_fuzzy = use_fuzzy.unwrap_or(true) && !q_trimmed.is_empty() && q_len >= 3;
+    let apply_fuzzy = use_fuzzy && !q_trimmed.is_empty() && q_len >= 3;
     let total_start = Instant::now();
 
     let guard = state.trigram_index.lock().unwrap();
@@ -1867,7 +1866,7 @@ fn find_files_in_compressed_text_index(
     extensions: Option<String>,
     category: Option<String>,
     limit: Option<u32>,
-    _use_fuzzy: Option<bool>,
+    _use_fuzzy: bool,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
     const DEFAULT_LIMIT: u32 = 500;
@@ -1962,7 +1961,7 @@ fn find_files_in_db(
     extensions: Option<String>,
     category: Option<String>,
     limit: Option<u32>,
-    _use_fuzzy: Option<bool>,
+    _use_fuzzy: bool,
     offset: Option<u32>,
 ) -> Result<FindFilesResponse, String> {
     const DEFAULT_LIMIT: u32 = 500;

@@ -101,6 +101,6 @@ export const findFiles = (
     extensions: extensions.trim().length > 0 ? extensions.trim() : null,
     category: category.trim() !== "" && category !== "all" ? category : null,
     limit: limit ?? 500,
-    use_fuzzy: useFuzzy,
+    useFuzzy,
     offset: offset ?? 0,
   });

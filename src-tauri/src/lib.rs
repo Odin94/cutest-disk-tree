@@ -1617,25 +1617,6 @@ fn find_files_in_ngram_index(
     let has_filter = extensions.as_ref().map_or(false, |s| !s.trim().is_empty())
         || category.as_deref().map_or(false, |c| !c.trim().is_empty() && c.trim() != "all");
 
-    // When filtering, overfetch so we have enough candidates to fill a page after post-filtering.
-    // Pagination is disabled when filtering because filtered counts are not easily predictable.
-    let (fetch_limit, fetch_offset) = if has_filter {
-        ((limit * 4).max(2000), 0usize)
-    } else {
-        (limit, offset)
-    };
-
-    let search_start = Instant::now();
-    let (indices, has_more_raw) = trigram_find_files(
-        &index_arc,
-        &query,
-        &SearchFilter::None,
-        fetch_limit,
-        fetch_offset,
-    );
-    let search_ms = search_start.elapsed().as_millis();
-
-    let filter_start = Instant::now();
     let extension_set: Option<std::collections::HashSet<String>> = extensions.as_ref().and_then(|s| {
         let cleaned: Vec<String> = s.split(',')
             .map(|x| x.trim().trim_start_matches('.').to_ascii_lowercase())
@@ -1644,25 +1625,146 @@ fn find_files_in_ngram_index(
         if cleaned.is_empty() { None } else { Some(cleaned.into_iter().collect()) }
     });
 
-    let (items, next_offset) = if has_filter {
-        let category_ref = category.as_deref();
-        let filtered: Vec<SearchEntry> = indices.iter()
-            .map(|&i| &index_arc.objects[i as usize])
-            .filter(|o| {
-                if let Some(ref set) = extension_set {
-                    match o.kind {
-                        DiskObjectKind::File => o.ext.as_ref().map(|e| set.contains(e)).unwrap_or(false),
-                        DiskObjectKind::Folder => true,
+    let passes_filter = |o: &DiskObject| -> bool {
+        if !has_filter { return true; }
+        if let Some(ref set) = extension_set {
+            match o.kind {
+                DiskObjectKind::File => o.ext.as_ref().map(|e| set.contains(e)).unwrap_or(false),
+                DiskObjectKind::Folder => true,
+            }
+        } else {
+            category_filter::category_allowed(category.as_deref(), o)
+        }
+    };
+
+    // For empty queries with a filter, scan all objects directly with correct pagination.
+    // The trigram index empty-query path only returns a bounded window by object position,
+    // which misses matching files that happen to sit beyond that window.
+    let filter_start = Instant::now();
+    let (items, next_offset) = if query.trim().is_empty() && has_filter {
+        let objects = &index_arc.objects;
+        let mut collected: Vec<SearchEntry> = Vec::new();
+        let mut next_off: Option<usize> = None;
+        let mut i = offset;
+        while i < objects.len() {
+            if passes_filter(&objects[i]) {
+                collected.push(search_entry_from_disk_object(&objects[i]));
+                if collected.len() == limit {
+                    if i + 1 < objects.len() {
+                        next_off = Some(i + 1);
                     }
-                } else {
-                    category_filter::category_allowed(category_ref, o)
+                    break;
                 }
-            })
-            .take(limit)
-            .map(|o| search_entry_from_disk_object(o))
-            .collect();
-        (filtered, None)
+            }
+            i += 1;
+        }
+        (collected, next_off)
+    } else if has_filter {
+        // Non-empty query with a category/extension filter.
+        //
+        // Strategy: intersect two trigram-index result sets instead of overfetching
+        // query results and post-filtering (which yields too few hits when the category
+        // is sparsely represented among the top-N query matches).
+        //
+        // For categories with known extensions we search the trigram index for each
+        // ".ext" suffix to get every file that belongs to the category, then intersect
+        // with the query matches.  For "folder" / "other" (no known extensions) we fall
+        // back to the overfetch approach since there's nothing extension-specific to
+        // search for.
+        let searchable_exts: Option<Vec<String>> = if let Some(ref set) = extension_set {
+            // Manual extension filter supplied by the caller
+            Some(set.iter().cloned().collect())
+        } else if let Some(cat) = category.as_deref().map(|c| c.trim()) {
+            search_category::extension_set(cat)
+                .map(|exts| exts.iter().map(|&e| e.to_string()).collect())
+        } else {
+            None
+        };
+
+        let search_start = Instant::now();
+        if let Some(exts) = searchable_exts {
+            // Step 1: collect all object indices whose filename contains ".{ext}"
+            let mut cat_set: HashSet<u32> = HashSet::new();
+            for ext in &exts {
+                let ext_query = format!(".{}", ext);
+                let (ext_matches, _) = trigram_find_files(
+                    &index_arc,
+                    &ext_query,
+                    &SearchFilter::None,
+                    usize::MAX,
+                    0,
+                );
+                cat_set.extend(ext_matches);
+            }
+
+            // Step 2: collect all object indices whose filename contains the query
+            let (query_matches, _) = trigram_find_files(
+                &index_arc,
+                &query,
+                &SearchFilter::None,
+                usize::MAX,
+                0,
+            );
+
+            let search_ms = search_start.elapsed().as_millis();
+            write_debug_log(state, &format!(
+                "find_files_in_ngram_index ext_search cat_candidates={} query_candidates={} ms={}",
+                cat_set.len(), query_matches.len(), search_ms,
+            ));
+
+            // Step 3: intersect — retain only indices present in both sets, sorted by
+            // object index so results stay in a stable order.
+            let query_set: HashSet<u32> = query_matches.into_iter().collect();
+            let mut combined: Vec<u32> = cat_set.into_iter()
+                .filter(|idx| query_set.contains(idx))
+                .collect();
+            combined.sort_unstable();
+
+            let s = offset.min(combined.len());
+            let e = (s + limit).min(combined.len());
+            let next_off = if e < combined.len() { Some(offset + limit) } else { None };
+            let items: Vec<SearchEntry> = combined[s..e].iter()
+                .map(|&i| search_entry_from_disk_object(&index_arc.objects[i as usize]))
+                .collect();
+            (items, next_off)
+        } else {
+            // "folder" or "other" — no extension set to search; overfetch and post-filter.
+            let fetch_limit = (limit * 4).max(2000);
+            let (indices, _) = trigram_find_files(
+                &index_arc,
+                &query,
+                &SearchFilter::None,
+                fetch_limit,
+                0,
+            );
+            let search_ms = search_start.elapsed().as_millis();
+            write_debug_log(state, &format!(
+                "find_files_in_ngram_index trigram_search ms={} candidates={}",
+                search_ms, indices.len(),
+            ));
+            let filtered: Vec<SearchEntry> = indices.iter()
+                .map(|&i| &index_arc.objects[i as usize])
+                .filter(|o| passes_filter(o))
+                .take(limit)
+                .map(|o| search_entry_from_disk_object(o))
+                .collect();
+            (filtered, None)
+        }
     } else {
+        // No filter — plain trigram search with pagination.
+        let search_start = Instant::now();
+        let (indices, has_more_raw) = trigram_find_files(
+            &index_arc,
+            &query,
+            &SearchFilter::None,
+            limit,
+            offset,
+        );
+        let search_ms = search_start.elapsed().as_millis();
+        write_debug_log(state, &format!(
+            "find_files_in_ngram_index trigram_search ms={} candidates={}",
+            search_ms, indices.len(),
+        ));
         let items: Vec<SearchEntry> = indices.iter()
             .map(|&i| search_entry_from_disk_object(&index_arc.objects[i as usize]))
             .collect();
@@ -1673,8 +1775,8 @@ fn find_files_in_ngram_index(
 
     let total_ms = total_start.elapsed().as_millis();
     write_debug_log(state, &format!(
-        "find_files search_ms={} filter_ms={} total_ms={} count={} query_len={}",
-        search_ms, filter_ms, total_ms, items.len(), query.len(),
+        "find_files filter_ms={} total_ms={} count={} query_len={}",
+        filter_ms, total_ms, items.len(), query.len(),
     ));
 
     Ok(FindFilesResponse { items, next_offset })

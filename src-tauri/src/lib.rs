@@ -594,20 +594,39 @@ fn run_phase2(
                 *disk_guard = Some(Arc::clone(&new_objs_arc));
             }
 
-            // For ngrams, rebuild the trigram index so search results carry folder sizes.
+            // For ngrams, update folder sizes in-place on the trigram index so search
+            // results carry the new sizes — no full rebuild needed since trigram posting
+            // lists are keyed on names, which haven't changed.
             if mode == SearchIndexMode::InMemoryNgrams {
-                let rebuild_start = Instant::now();
+                let update_start = Instant::now();
+                let folder_sizes_str: HashMap<String, u64> = folder_sizes
+                    .iter()
+                    .map(|(p, &s)| (p.to_string_lossy().into_owned(), s))
+                    .collect();
+
+                let new_folder_objects: Vec<DiskObject> = {
+                    let index_guard = state_ptr.trigram_index.lock().unwrap();
+                    folder_sizes_str
+                        .iter()
+                        .filter(|(path, _)| !index_guard.path_to_idx.contains_key(path.as_str()))
+                        .map(|(path, &size)| make_disk_object_from_path(
+                            path.clone(),
+                            DiskObjectKind::Folder,
+                            None, Some(size), None, None, None,
+                        ))
+                        .collect()
+                };
+
+                {
+                    let mut index_guard = state_ptr.trigram_index.lock().unwrap();
+                    index_guard.update_folder_sizes(&folder_sizes_str, new_folder_objects);
+                }
+
                 write_debug_log(&state_ptr, &format!(
-                    "phase2 rebuilding trigram index after folder_sizes objects={}",
-                    new_objs_arc.len(),
+                    "phase2 trigram_update_folder_sizes done ms={} total_ms={}",
+                    update_start.elapsed().as_millis(),
+                    total_start.elapsed().as_millis(),
                 ));
-                let new_index = trigram_build_index(&new_objs_arc);
-                let rebuild_ms = rebuild_start.elapsed().as_millis();
-                write_debug_log(&state_ptr, &format!(
-                    "phase2 trigram_rebuild done ms={} total_ms={}",
-                    rebuild_ms, total_start.elapsed().as_millis(),
-                ));
-                *state_ptr.trigram_index.lock().unwrap() = new_index;
             }
         }
     }

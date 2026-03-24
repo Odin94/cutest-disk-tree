@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -196,7 +196,7 @@ type FileRowProps = {
   useSimpleAnimation?: boolean;
 };
 
-const FileRow = ({ file, index, query, useSimpleAnimation = false }: FileRowProps) => {
+const FileRow = memo(({ file, index, query, useSimpleAnimation = false }: FileRowProps) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [selectedLabel, setSelectedLabel] = useState<string | null>(null);
@@ -423,7 +423,16 @@ const FileRow = ({ file, index, query, useSimpleAnimation = false }: FileRowProp
         : null}
     </motion.div>
   );
-};
+}, (prev, next) =>
+  prev.file.path === next.file.path &&
+  prev.file.size === next.file.size &&
+  prev.file.kind === next.file.kind &&
+  prev.file.file_key?.dev === next.file.file_key?.dev &&
+  prev.file.file_key?.ino === next.file.file_key?.ino &&
+  prev.index === next.index &&
+  prev.query === next.query &&
+  prev.useSimpleAnimation === next.useSimpleAnimation
+);
 
 const LoadingSpinner = () => (
   <div className="flex items-center justify-center py-6 gap-3">
@@ -477,7 +486,7 @@ export const FileTable = ({
     }
   };
 
-  const sorted = [...files].sort((a, b) => {
+  const sorted = useMemo(() => [...files].sort((a, b) => {
     const mul = sortDir === "asc" ? 1 : -1;
     if (sortField === "size") return (a.size - b.size) * mul;
     if (sortField === "path") return a.path.localeCompare(b.path) * mul;
@@ -487,7 +496,7 @@ export const FileTable = ({
       return typeA.localeCompare(typeB) * mul;
     }
     return getFileName(a.path).localeCompare(getFileName(b.path)) * mul;
-  });
+  }), [files, sortField, sortDir]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = 0;

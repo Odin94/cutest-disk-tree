@@ -156,6 +156,26 @@ impl TrigramIndex {
     pub fn live_count(&self) -> usize {
         self.objects.len() - self.deleted.len()
     }
+
+    /// Update `recursive_size` on existing folder objects in-place, then append any
+    /// `new_objects` (folders that were not previously in the index).
+    ///
+    /// Avoids a full index rebuild when only folder sizes change after a scan — the
+    /// trigram posting lists are keyed on names, which are unaffected by size updates.
+    pub fn update_folder_sizes(
+        &mut self,
+        sizes: &std::collections::HashMap<String, u64>,
+        new_objects: Vec<DiskObject>,
+    ) {
+        for (path, &size) in sizes {
+            if let Some(&idx) = self.path_to_idx.get(path.as_str()) {
+                self.objects[idx as usize].recursive_size = Some(size);
+            }
+        }
+        for obj in new_objects {
+            self.add(obj);
+        }
+    }
 }
 
 // ── Entry points ────────────────────────────────────────────────────────────

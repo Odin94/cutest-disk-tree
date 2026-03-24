@@ -194,9 +194,10 @@ const App = () => {
 
   // On startup, check if a scan is already in progress and show loading UI
   useEffect(() => {
+    const t = performance.now();
     getScanStatus().then((isScanning) => {
+      debugLog(`App getScanStatus ms=${Math.round(performance.now() - t)} isScanning=${isScanning}`);
       if (isScanning) {
-        debugLog("App mount: scan already in progress, entering observer mode");
         observingScanRef.current = true;
         scanInProgressRef.current = true;
         setLoading(true);
@@ -210,10 +211,12 @@ const App = () => {
   }, []);
 
   useEffect(() => {
+    const t = performance.now();
     debugLog("App mount: loading cached scan");
     loadCachedScan().then((summary) => {
+      const loadMs = Math.round(performance.now() - t);
       if (summary != null) {
-        debugLog(`App cached scan loaded files_count=${summary.files_count} folders_count=${summary.folders_count}`);
+        debugLog(`App cached scan loaded files_count=${summary.files_count} folders_count=${summary.folders_count} load_ms=${loadMs}`);
         setResult({
           roots: summary.roots,
           files: [],
@@ -222,7 +225,7 @@ const App = () => {
           folders_count: summary.folders_count,
         });
       } else {
-        debugLog("App no cached scan found");
+        debugLog(`App no cached scan found load_ms=${loadMs}`);
       }
     }).catch((e) => {
       debugLog(`App loadCachedScan error: ${e instanceof Error ? e.message : String(e)}`);
@@ -297,17 +300,16 @@ const App = () => {
       />
 
       <div className="views">
-        <div
-          className="view view-disk-usage"
-          style={{ display: category === "disk" ? "block" : "none" }}
-        >
-          <DiskUsageView
-            result={result}
-            onScan={runScan}
-            scanning={loading}
-            scanProgress={progress}
-          />
-        </div>
+        {category === "disk" && (
+          <div className="view view-disk-usage">
+            <DiskUsageView
+              result={result}
+              onScan={runScan}
+              scanning={loading}
+              scanProgress={progress}
+            />
+          </div>
+        )}
         <div
           className="view view-file-finding"
           style={{ display: category === "find" ? "block" : "none" }}

@@ -253,7 +253,7 @@ pub fn get_scan_summary(
     )?;
 
     let mut folder_stmt = conn.prepare(
-        "SELECT path, recursive_size FROM disk_objects WHERE kind = 'folder' ORDER BY recursive_size DESC",
+        "SELECT path, recursive_size FROM disk_objects WHERE kind = 'folder'",
     )?;
     let folder_sizes: std::collections::HashMap<String, u64> = folder_stmt
         .query_map([], |row| {
@@ -284,6 +284,43 @@ pub fn get_scan_summary(
         folders_count,
         folder_sizes,
     }))
+}
+
+/// Fast variant that returns only counts and root paths — no folder_sizes map.
+/// Runs two COUNT queries and a small root-path scan; typically <10 ms.
+pub fn get_scan_summary_brief(
+    conn: &Connection,
+) -> rusqlite::Result<Option<(u64, u64, Vec<String>)>> {
+    let object_count: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM disk_objects",
+        [], |row| row.get(0),
+    )?;
+    if object_count == 0 {
+        return Ok(None);
+    }
+
+    let files_count: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM disk_objects WHERE kind = 'file'",
+        [], |row| row.get(0),
+    )?;
+    let folders_count: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM disk_objects WHERE kind = 'folder'",
+        [], |row| row.get(0),
+    )?;
+
+    // Roots are top-level drive/mount paths: no meaningful parent or very short path.
+    let mut root_stmt = conn.prepare(
+        "SELECT path FROM disk_objects \
+         WHERE kind = 'folder' \
+         AND (parent_path IS NULL OR parent_path = '' OR length(path) <= 4) \
+         LIMIT 16",
+    )?;
+    let roots: Vec<String> = root_stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Some((files_count as u64, folders_count as u64, roots)))
 }
 
 pub fn get_scan_result_timed(

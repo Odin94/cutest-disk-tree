@@ -265,6 +265,31 @@ fn write_debug_log(state: &AppState, message: &str) {
     cutest_disk_tree::logging::debug_log::write_debug_log(&path, message);
 }
 
+/// Writes the startup header and environment-variable block to the debug log.
+/// Called from the background task so it doesn't block window startup.
+fn write_startup_config_log(state: &AppState, index_mode: SearchIndexMode) {
+    use std::io::Write;
+    let path = resolve_debug_log_path(state);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| {
+            writeln!(f, "=== starting cutest disk tree ===")?;
+            writeln!(f)?;
+            writeln!(f, "Loaded config from environment:")?;
+            writeln!(f, "CUTE_DISK_TREE_INDEX_MODE={:?}", index_mode)?;
+            if let Ok(p) = std::env::var("CUTE_DISK_TREE_DEBUG_LOG_PATH") {
+                writeln!(f, "CUTE_DISK_TREE_DEBUG_LOG_PATH={}", p)?;
+            }
+            if let Ok(p) = std::env::var("CUTE_DISK_TREE_SCAN_PATH") {
+                writeln!(f, "CUTE_DISK_TREE_SCAN_PATH={}", p)?;
+            }
+            writeln!(f)?;
+            f.flush()
+        });
+}
+
 fn start_file_watchers(state: &AppState, roots: Vec<std::path::PathBuf>) {
     let index = Arc::clone(&state.trigram_index);
     let scan_flag = Arc::clone(&state.is_scanning);
@@ -1066,11 +1091,21 @@ async fn load_cached_scan(
             }
         }
         SearchIndexMode::Sqlite | SearchIndexMode::InMemorySuffix | SearchIndexMode::InMemoryNgrams => {
+            // Fast path: only reads row counts + root paths.  No folder_sizes scan.
+            // folder_sizes are delivered asynchronously via scan-folder-sizes-ready.
             match tauri::async_runtime::spawn_blocking({
                 let db_path = db_path.clone();
-                move || {
+                move || -> Result<Option<cutest_disk_tree::ScanSummary>, String> {
                     let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
-                    db::get_scan_summary(&conn).map_err(|e| e.to_string())
+                    match db::get_scan_summary_brief(&conn).map_err(|e| e.to_string())? {
+                        Some((files_count, folders_count, roots)) => Ok(Some(cutest_disk_tree::ScanSummary {
+                            roots,
+                            files_count,
+                            folders_count,
+                            folder_sizes: std::collections::HashMap::new(),
+                        })),
+                        None => Ok(None),
+                    }
                 }
             }).await {
                 Ok(Ok(s)) => s,
@@ -1105,6 +1140,10 @@ async fn load_cached_scan(
                     return;
                 }
             };
+            // Deliver folder sizes to the frontend immediately — before the (slow) index build.
+            let _ = app_bg.emit("scan-folder-sizes-ready", FolderSizesReady {
+                folder_sizes: scan_result.folder_sizes.clone(),
+            });
             let files: Vec<cutest_disk_tree::FileEntry> = scan_result.files.iter().map(|f| {
                 cutest_disk_tree::FileEntry {
                     path: std::path::PathBuf::from(&f.path),
@@ -2061,6 +2100,7 @@ fn load_dotenv_from_repo() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let startup_instant = Instant::now();
     load_dotenv_from_repo();
 
     // TODOdin: Remember that we set this in .env!
@@ -2072,50 +2112,29 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(move |app| {
+            let t_setup = Instant::now();
             let path = app.path().app_data_dir().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
             let db_path = path.join("index.db");
             let index_mode = parse_index_mode();
 
-            if !matches!(index_mode, SearchIndexMode::CompressedText) {
-                db::open_db(&db_path).map_err(|e| e.to_string())?;
-            }
+            // db::open_db (SQLite open + migrations) is deferred to the background
+            // task below so it does not block the window from opening.
 
             let env_log_path = std::env::var("CUTE_DISK_TREE_DEBUG_LOG_PATH").ok();
             let debug_log_path = env_log_path
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| path.join("debug.log"));
 
-            cutest_disk_tree::logging::debug_log::init_debug_logger(debug_log_path.clone());
-
+            // Truncate the log file now (fast) so old content doesn't accumulate;
+            // the startup header and env-var block are written in the background task.
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&debug_log_path)
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(b"=== starting cutest disk tree ===\n\n")?;
-                    f.flush()
-                });
+                .open(&debug_log_path);
 
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&debug_log_path)
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    writeln!(f, "Loaded config from environment:")?;
-                    writeln!(f, "CUTE_DISK_TREE_INDEX_MODE={:?}", index_mode)?;
-                    if let Ok(p) = std::env::var("CUTE_DISK_TREE_DEBUG_LOG_PATH") {
-                        writeln!(f, "CUTE_DISK_TREE_DEBUG_LOG_PATH={}", p)?;
-                    }
-                    if let Ok(p) = std::env::var("CUTE_DISK_TREE_SCAN_PATH") {
-                        writeln!(f, "CUTE_DISK_TREE_SCAN_PATH={}", p)?;
-                    }
-                    writeln!(f)?;
-                    f.flush()
-                });
+            cutest_disk_tree::logging::debug_log::init_debug_logger(debug_log_path.clone());
 
             let force_fresh = scan_path_override.is_some();
 
@@ -2124,7 +2143,7 @@ pub fn run() {
             // background task below.
             app.manage(AppState {
                 db_path: db_path.clone(),
-                debug_log: Mutex::new(Some(debug_log_path)),
+                debug_log: Mutex::new(Some(debug_log_path.clone())),
                 disk_objects: Mutex::new(None),
                 name_reverse_index: Mutex::new(None),
                 trigram_index: Arc::new(Mutex::new(trigram_build_index(&[]))),
@@ -2136,25 +2155,34 @@ pub fn run() {
                 _reconciler: Mutex::new(None),
             });
 
+            let setup_ms = t_setup.elapsed().as_millis();
+            let startup_ms = startup_instant.elapsed().as_millis();
+
             let handle = app.handle().clone();
             if force_fresh {
                 let state_ref: tauri::State<AppState> = app.state();
-                write_debug_log(&state_ref, "setup: force_fresh=true, spawning auto-scan");
+                write_debug_log(&state_ref, &format!(
+                    "setup: startup_ms={startup_ms} setup_ms={setup_ms} force_fresh=true"
+                ));
                 tauri::async_runtime::spawn(async move {
                     let state: tauri::State<AppState> = handle.state();
+                    write_startup_config_log(&state, index_mode);
                     write_debug_log(&state, "setup: auto-scan task starting");
                     let _ = scan_directory(handle.clone(), state).await;
                 });
             } else {
                 let state_ref: tauri::State<AppState> = app.state();
                 write_debug_log(&state_ref, &format!(
-                    "setup: force_fresh=false scan_path_override={:?}",
+                    "setup: startup_ms={startup_ms} setup_ms={setup_ms} force_fresh=false scan_path_override={:?}",
                     scan_path_override
                 ));
-                if uses_in_memory_index(index_mode) {
-                    tauri::async_runtime::spawn(async move {
-                        let state: tauri::State<AppState> = handle.state();
+                tauri::async_runtime::spawn(async move {
+                    let state: tauri::State<AppState> = handle.state();
+                    write_startup_config_log(&state, index_mode);
+
+                    if uses_in_memory_index(index_mode) {
                         let db_path = state.db_path.clone();
+                        let t_bg = Instant::now();
                         let result = tauri::async_runtime::spawn_blocking(move || {
                             let conn = db::open_db(&db_path).map_err(|e| e.to_string())?;
                             if !db::has_disk_objects(&conn).unwrap_or(false) {
@@ -2226,10 +2254,31 @@ pub fn run() {
                                 };
                                 start_file_watchers(&state, roots);
                             }
-                            write_debug_log(&state, "setup: background index load complete");
+                            write_debug_log(&state, &format!(
+                                "setup: background index load complete bg_ms={}",
+                                t_bg.elapsed().as_millis()
+                            ));
+                        } else {
+                            write_debug_log(&state, &format!(
+                                "setup: background index load (no data) bg_ms={}",
+                                t_bg.elapsed().as_millis()
+                            ));
                         }
-                    });
-                }
+                    } else if !matches!(index_mode, SearchIndexMode::CompressedText) {
+                        // Sqlite mode: initialise the DB (open + migrations) in the background
+                        // so it does not block window startup.
+                        let db_path = state.db_path.clone();
+                        let t_db = Instant::now();
+                        let db_result = tauri::async_runtime::spawn_blocking(move || {
+                            db::open_db(&db_path)
+                        }).await;
+                        write_debug_log(&state, &format!(
+                            "setup: sqlite db init bg_ms={} ok={}",
+                            t_db.elapsed().as_millis(),
+                            db_result.map_or(false, |r| r.is_ok()),
+                        ));
+                    }
+                });
             }
 
             Ok(())

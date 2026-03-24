@@ -35,6 +35,7 @@ const SearchBar = ({
           onChange={(e) => onQueryChange(e.target.value)}
           placeholder="Search your cozy file collection..."
           disabled={disabled}
+          autoFocus
           className="flex-1 min-w-0 bg-transparent border-none outline-none text-foreground placeholder:text-muted-foreground py-3 font-body text-base disabled:opacity-60"
         />
         {query ? (

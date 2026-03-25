@@ -27,90 +27,42 @@ use serde::Serialize;
 use std::io::Write;
 use sysinfo::{Pid, System};
 
-mod category_filter {
-    use cutest_disk_tree::{DiskObject, DiskObjectKind};
-    use std::collections::HashSet;
-
-    const AUDIO: &[&str] = &["mp3", "wav", "flac", "m4a", "ogg", "aac", "opus"];
-    const DOCUMENT: &[&str] = &[
-        "pdf", "txt", "md", "rtf", "doc", "docx", "odt", "xls", "xlsx", "csv",
-        "ppt", "pptx",
-    ];
-    const VIDEO: &[&str] = &["mp4", "mkv", "mov", "avi", "webm", "m4v"];
-    const IMAGE: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "heic", "bmp", "tiff", "svg"];
-    const EXECUTABLE: &[&str] = &[
-        "exe", "dll", "so", "dylib", "bin", "sh", "bat", "cmd", "appimage",
-    ];
-    const COMPRESSED: &[&str] = &["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz"];
-    const CONFIG: &[&str] = &[
-        "cfg", "conf", "ini", "json", "yaml", "yml", "toml", "xml", "props",
-        "properties", "rc", "config", "env",
-    ];
-
-    fn all_known_extensions() -> HashSet<&'static str> {
-        AUDIO
-            .iter()
-            .chain(DOCUMENT)
-            .chain(VIDEO)
-            .chain(IMAGE)
-            .chain(EXECUTABLE)
-            .chain(COMPRESSED)
-            .chain(CONFIG)
-            .copied()
-            .collect()
+fn category_allowed(category: Option<&str>, obj: &DiskObject) -> bool {
+    let category = match category {
+        None => return true,
+        Some("all") | Some("") => return true,
+        Some(c) => c.trim(),
+    };
+    if category.is_empty() {
+        return true;
     }
-
-    fn extension_set(category: &str) -> Option<HashSet<&'static str>> {
-        let set: HashSet<&str> = match category {
-            "audio" => AUDIO.iter().copied().collect(),
-            "document" => DOCUMENT.iter().copied().collect(),
-            "video" => VIDEO.iter().copied().collect(),
-            "image" => IMAGE.iter().copied().collect(),
-            "executable" => EXECUTABLE.iter().copied().collect(),
-            "compressed" => COMPRESSED.iter().copied().collect(),
-            "config" => CONFIG.iter().copied().collect(),
-            _ => return None,
-        };
-        Some(set)
-    }
-
-    pub fn category_allowed(category: Option<&str>, obj: &DiskObject) -> bool {
-        let category = match category {
-            None => return true,
-            Some("all") | Some("") => return true,
-            Some(c) => c.trim(),
-        };
-        if category.is_empty() {
-            return true;
+    match category {
+        "folder" => matches!(obj.kind, DiskObjectKind::Folder),
+        "other" => {
+            if matches!(obj.kind, DiskObjectKind::Folder) {
+                return false;
+            }
+            let known = search_category::all_known_extensions();
+            match &obj.ext {
+                None => true,
+                Some(ext) => {
+                    let ext_lower = ext.trim().to_lowercase();
+                    !known.iter().any(|&e| e == ext_lower.as_str())
+                }
+            }
         }
-        match category {
-            "folder" => matches!(obj.kind, DiskObjectKind::Folder),
-            "other" => {
-                if matches!(obj.kind, DiskObjectKind::Folder) {
-                    return false;
-                }
-                let known = all_known_extensions();
-                match &obj.ext {
-                    None => true,
-                    Some(ext) => {
-                        let ext_lower = ext.trim().to_lowercase();
-                        !known.contains(ext_lower.as_str())
-                    }
-                }
+        _ => {
+            if matches!(obj.kind, DiskObjectKind::Folder) {
+                return false;
             }
-            _ => {
-                if matches!(obj.kind, DiskObjectKind::Folder) {
-                    return false;
-                }
-                let set = match extension_set(category) {
-                    Some(s) => s,
-                    None => return true,
-                };
-                obj.ext.as_ref().map(|e| {
-                    let ext_lower = e.trim().to_lowercase();
-                    set.contains(ext_lower.as_str())
-                }).unwrap_or(false)
-            }
+            let set = match search_category::extension_set(category) {
+                Some(s) => s,
+                None => return true,
+            };
+            obj.ext.as_ref().map(|e| {
+                let ext_lower = e.trim().to_lowercase();
+                set.iter().any(|&s| s == ext_lower.as_str())
+            }).unwrap_or(false)
         }
     }
 }
@@ -248,7 +200,7 @@ struct AppState {
 }
 
 fn resolve_debug_log_path(state: &AppState) -> std::path::PathBuf {
-    let mut guard = state.debug_log.lock().unwrap();
+    let mut guard = state.debug_log.lock().unwrap_or_else(|e| e.into_inner());
     guard
         .get_or_insert_with(|| {
             state
@@ -294,10 +246,10 @@ fn start_file_watchers(state: &AppState, roots: Vec<std::path::PathBuf>) {
     let index = Arc::clone(&state.trigram_index);
     let scan_flag = Arc::clone(&state.is_scanning);
     match IndexWatcher::new(Arc::clone(&index), roots.clone()) {
-        Ok(w) => { *state._watcher.lock().unwrap() = Some(w); }
+        Ok(w) => { *state._watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(w); }
         Err(e) => { write_debug_log(state, &format!("start_file_watchers: watcher error: {:?}", e)); }
     }
-    *state._reconciler.lock().unwrap() = Some(IndexReconciler::new(index, roots, scan_flag));
+    *state._reconciler.lock().unwrap_or_else(|e| e.into_inner()) = Some(IndexReconciler::new(index, roots, scan_flag));
     write_debug_log(state, "start_file_watchers: watcher and reconciler started");
 }
 
@@ -481,9 +433,9 @@ fn activate_initial_index(
             }
 
             {
-                let mut disk_guard = state.disk_objects.lock().unwrap();
+                let mut disk_guard = state.disk_objects.lock().unwrap_or_else(|e| e.into_inner());
                 *disk_guard = Some(Arc::new(objs));
-                *state.trigram_index.lock().unwrap() = index;
+                *state.trigram_index.lock().unwrap_or_else(|e| e.into_inner()) = index;
             }
         }
         _ => {
@@ -506,9 +458,9 @@ fn activate_initial_index(
             }
 
             {
-                let mut disk_guard = state.disk_objects.lock().unwrap();
+                let mut disk_guard = state.disk_objects.lock().unwrap_or_else(|e| e.into_inner());
                 *disk_guard = Some(Arc::new(objs));
-                let mut idx_guard = state.name_reverse_index.lock().unwrap();
+                let mut idx_guard = state.name_reverse_index.lock().unwrap_or_else(|e| e.into_inner());
                 *idx_guard = Some(Arc::new(index));
             }
         }
@@ -577,7 +529,7 @@ fn run_phase2(
         write_debug_log(&state_ptr, "phase2 applying folder sizes to index");
         let _ = app_bg.emit("scan-phase-status", "updating search index with sizes...".to_string());
         let existing_arc = {
-            let guard = state_ptr.disk_objects.lock().unwrap();
+            let guard = state_ptr.disk_objects.lock().unwrap_or_else(|e| e.into_inner());
             guard.clone()
         };
         if let Some(arc) = existing_arc {
@@ -590,7 +542,7 @@ fn run_phase2(
             ));
             let new_objs_arc = Arc::new(new_objs);
             {
-                let mut disk_guard = state_ptr.disk_objects.lock().unwrap();
+                let mut disk_guard = state_ptr.disk_objects.lock().unwrap_or_else(|e| e.into_inner());
                 *disk_guard = Some(Arc::clone(&new_objs_arc));
             }
 
@@ -605,7 +557,7 @@ fn run_phase2(
                     .collect();
 
                 let new_folder_objects: Vec<DiskObject> = {
-                    let index_guard = state_ptr.trigram_index.lock().unwrap();
+                    let index_guard = state_ptr.trigram_index.lock().unwrap_or_else(|e| e.into_inner());
                     folder_sizes_str
                         .iter()
                         .filter(|(path, _)| !index_guard.path_to_idx.contains_key(path.as_str()))
@@ -618,7 +570,7 @@ fn run_phase2(
                 };
 
                 {
-                    let mut index_guard = state_ptr.trigram_index.lock().unwrap();
+                    let mut index_guard = state_ptr.trigram_index.lock().unwrap_or_else(|e| e.into_inner());
                     index_guard.update_folder_sizes(&folder_sizes_str, new_folder_objects);
                 }
 
@@ -740,7 +692,7 @@ fn run_phase2(
                     ));
                 } else if mode == SearchIndexMode::InMemorySuffix {
                     // Persist suffix index so startup can reload it without rebuilding.
-                    let index_arc = { state_ptr.name_reverse_index.lock().unwrap().clone() };
+                    let index_arc = { state_ptr.name_reverse_index.lock().unwrap_or_else(|e| e.into_inner()).clone() };
                     if let Some(arc) = index_arc {
                         let _ = db::write_suffix_index_data(
                             &conn, update_id,
@@ -941,18 +893,18 @@ async fn scan_directory_with_helper(
     ));
 
     let cancel_token = {
-        let mut guard = state.phase2_cancel.lock().unwrap();
+        let mut guard = state.phase2_cancel.lock().map_err(|e| format!("lock poisoned: {}", e))?;
         guard.store(true, Ordering::Relaxed);
         let fresh = Arc::new(AtomicBool::new(false));
         *guard = fresh.clone();
         fresh
     };
     {
-        let mut disk_guard = state.disk_objects.lock().unwrap();
+        let mut disk_guard = state.disk_objects.lock().map_err(|e| format!("lock poisoned: {}", e))?;
         *disk_guard = None;
-        let mut idx_guard = state.name_reverse_index.lock().unwrap();
+        let mut idx_guard = state.name_reverse_index.lock().map_err(|e| format!("lock poisoned: {}", e))?;
         *idx_guard = None;
-        *state.trigram_index.lock().unwrap() = trigram_build_index(&[]);
+        *state.trigram_index.lock().map_err(|e| format!("lock poisoned: {}", e))? = trigram_build_index(&[]);
     }
 
     let response = ScanDirectoryResponse {
@@ -1013,6 +965,7 @@ async fn scan_directory(
     let roots_for_scan = scan_roots.clone();
     let scan_log_path = resolve_debug_log_path(&state);
     let (files_arc, all_folder_paths, roots_str) = match tauri::async_runtime::spawn_blocking(move || {
+        let mut last_progress_emit: Option<Instant> = None;
         let (files_arc, all_folders, roots_str) =
             cutest_disk_tree::core::scanning::ignore_scanner::scan_roots_with_ignore(
                 &roots_for_scan,
@@ -1027,7 +980,15 @@ async fn scan_directory(
                             );
                         }
                     }
-                    let _ = app_for_scan.emit("scan-progress", &p);
+                    let now = Instant::now();
+                    let should_emit = match last_progress_emit {
+                        None => true,
+                        Some(t) => now.duration_since(t).as_millis() >= 100,
+                    };
+                    if should_emit {
+                        last_progress_emit = Some(now);
+                        let _ = app_for_scan.emit("scan-progress", &p);
+                    }
                 },
             );
         Ok::<_, String>((files_arc, all_folders, roots_str))
@@ -1052,18 +1013,18 @@ async fn scan_directory(
     ));
 
     let cancel_token = {
-        let mut guard = state.phase2_cancel.lock().unwrap();
+        let mut guard = state.phase2_cancel.lock().map_err(|e| format!("lock poisoned: {}", e))?;
         guard.store(true, Ordering::Relaxed);
         let fresh = Arc::new(AtomicBool::new(false));
         *guard = fresh.clone();
         fresh
     };
     {
-        let mut disk_guard = state.disk_objects.lock().unwrap();
+        let mut disk_guard = state.disk_objects.lock().map_err(|e| format!("lock poisoned: {}", e))?;
         *disk_guard = None;
-        let mut idx_guard = state.name_reverse_index.lock().unwrap();
+        let mut idx_guard = state.name_reverse_index.lock().map_err(|e| format!("lock poisoned: {}", e))?;
         *idx_guard = None;
-        *state.trigram_index.lock().unwrap() = trigram_build_index(&[]);
+        *state.trigram_index.lock().map_err(|e| format!("lock poisoned: {}", e))? = trigram_build_index(&[]);
     }
     let response = ScanDirectoryResponse {
         roots: roots_str,
@@ -1139,7 +1100,7 @@ async fn load_cached_scan(
 
     if summary.is_some() && uses_in_memory_index(mode) {
         let app_bg = app.clone();
-        let cancel = { state.phase2_cancel.lock().unwrap().clone() };
+        let cancel = { state.phase2_cancel.lock().map_err(|e| format!("lock poisoned: {}", e))?.clone() };
         write_debug_log(&state, "load_cached_scan: spawning background index build from DB");
         tauri::async_runtime::spawn_blocking(move || {
             let state_ptr: tauri::State<AppState> = app_bg.state();
@@ -1391,7 +1352,7 @@ fn find_files(
         SearchIndexMode::CompressedText => find_files_in_compressed_text_index(&state, query, extensions, category, limit, use_fuzzy, offset),
         SearchIndexMode::Sqlite => find_files_in_db(&state, query, extensions, category, limit, use_fuzzy, offset),
         SearchIndexMode::InMemoryNgrams => {
-            let has_index = !state.trigram_index.lock().unwrap().objects.is_empty();
+            let has_index = !state.trigram_index.lock().map_err(|e| format!("lock poisoned: {}", e))?.objects.is_empty();
             if has_index {
                 find_files_in_ngram_index(&state, query, extensions, category, limit, use_fuzzy, offset)
             } else {
@@ -1399,7 +1360,7 @@ fn find_files(
             }
         }
         SearchIndexMode::InMemorySuffix => {
-            let has_memory_index = state.disk_objects.lock().unwrap().is_some();
+            let has_memory_index = state.disk_objects.lock().map_err(|e| format!("lock poisoned: {}", e))?.is_some();
             if has_memory_index {
                 find_files_in_memory(&state, query, extensions, category, limit, use_fuzzy, offset)
             } else {
@@ -1433,7 +1394,7 @@ fn find_files_in_memory(
     );
 
     let disk_entries_arc = {
-        let guard = state.disk_objects.lock().unwrap();
+        let guard = state.disk_objects.lock().map_err(|e| format!("lock poisoned: {}", e))?;
         if let Some(entries) = guard.as_ref() {
             let t = total_start.elapsed().as_millis();
             write_debug_log(
@@ -1496,7 +1457,7 @@ fn find_files_in_memory(
             let mut mask: Vec<bool> = Vec::with_capacity(disk_entries.len());
             let mut count = 0usize;
             for o in disk_entries {
-                let allowed = category_filter::category_allowed(category_ref.map(|s| s.trim()), o);
+                let allowed = category_allowed(category_ref.map(|s| s.trim()), o);
                 if allowed {
                     count += 1;
                 }
@@ -1559,7 +1520,7 @@ fn find_files_in_memory(
 
     let suffix_search_start = Instant::now();
     let candidate_set_opt = {
-        let guard = state.name_reverse_index.lock().unwrap();
+        let guard = state.name_reverse_index.lock().map_err(|e| format!("lock poisoned: {}", e))?;
         guard
             .as_ref()
             .and_then(|idx| suffix_find_files(idx.as_ref(), &q))
@@ -1709,7 +1670,7 @@ fn find_files_in_ngram_index(
     let apply_fuzzy = use_fuzzy && !q_trimmed.is_empty() && q_len >= 3;
     let total_start = Instant::now();
 
-    let guard = state.trigram_index.lock().unwrap();
+    let guard = state.trigram_index.lock().map_err(|e| format!("lock poisoned: {}", e))?;
     let index_arc = &*guard;
     if index_arc.objects.is_empty() {
         return Ok(FindFilesResponse { items: vec![], next_offset: None });
@@ -1734,7 +1695,7 @@ fn find_files_in_ngram_index(
                 DiskObjectKind::Folder => false,
             }
         } else {
-            category_filter::category_allowed(category.as_deref(), o)
+            category_allowed(category.as_deref(), o)
         }
     };
 
@@ -2090,21 +2051,17 @@ fn find_files_in_db(
     })
 }
 
+#[cfg(debug_assertions)]
 fn load_dotenv_from_repo() {
     use std::path::PathBuf;
 
-    // 1. Try the workspace root (parent of the src-tauri crate)
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Some(parent) = manifest_dir.parent() {
         candidates.push(parent.join(".env"));
     }
-
-    // 2. Try the src-tauri crate directory itself
     candidates.push(manifest_dir.join(".env"));
-
-    // 3. Try the current working directory (useful in dev)
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join(".env"));
     }
@@ -2120,6 +2077,7 @@ fn load_dotenv_from_repo() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let startup_instant = Instant::now();
+    #[cfg(debug_assertions)]
     load_dotenv_from_repo();
 
     // TODOdin: Remember that we set this in .env!
@@ -2263,10 +2221,10 @@ pub fn run() {
                         }).await;
 
                         if let Ok(Ok(Some((objs, name_idx, trigram_idx)))) = result {
-                            *state.disk_objects.lock().unwrap() = Some(objs);
-                            *state.name_reverse_index.lock().unwrap() = name_idx;
+                            *state.disk_objects.lock().unwrap_or_else(|e| e.into_inner()) = Some(objs);
+                            *state.name_reverse_index.lock().unwrap_or_else(|e| e.into_inner()) = name_idx;
                             if let Some(ti) = trigram_idx {
-                                *state.trigram_index.lock().unwrap() = ti;
+                                *state.trigram_index.lock().unwrap_or_else(|e| e.into_inner()) = ti;
                                 let roots = match &state.scan_path_override {
                                     Some(p) => vec![std::path::PathBuf::from(p)],
                                     None => cutest_disk_tree::get_filesystem_roots(),

@@ -7,8 +7,8 @@ cd "$REPO_ROOT"
 echo "=== Cutest Disk Tree – Build and prepare release (this OS) ==="
 echo ""
 
-if [[ ! -f ".tauri-private-key" ]] || [[ ! -f ".tauri-public-key" ]]; then
-  echo "Error: .tauri-private-key and .tauri-public-key must exist in the repo root."
+if [[ ! -f ".tauri-updater-key" ]] || [[ ! -f ".tauri-updater-key.pub" ]]; then
+  echo "Error: .tauri-updater-key and .tauri-updater-key.pub must exist in the repo root."
   exit 1
 fi
 
@@ -24,17 +24,15 @@ if [[ ! "${REPLY,,}" =~ ^y ]]; then
   exit 1
 fi
 
-PRIVATE_KEY_B64="$(cat .tauri-private-key)"
-TAURI_PRIVATE_KEY="$(echo "$PRIVATE_KEY_B64" | base64 -d 2>/dev/null || echo "$PRIVATE_KEY_B64" | base64 -D 2>/dev/null)"
-
 echo "Running npm install..."
 npm install
 
 echo "Generating icons if needed..."
 node scripts/gen-icon.cjs 2>/dev/null || true
 
-echo "Building signed Tauri app (this may take a while)..."
-export TAURI_SIGNING_PRIVATE_KEY="$TAURI_PRIVATE_KEY"
+echo "Building signed Tauri app (this may take a while)..." 
+export TAURI_SIGNING_PRIVATE_KEY="$(tr -d '\r\n' < .tauri-updater-key)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="pass"
 npm run tauri build
 
 echo ""

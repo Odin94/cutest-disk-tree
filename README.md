@@ -30,7 +30,7 @@ npm run tauri dev
 - **Largest folders**: Top 100 folders by recursive size.
 - **Largest files**: Top 200 files by size.
 - **Duplicates**: Placeholder (hashing not implemented yet).
-- **Check for updates**: Uses `tauri-plugin-updater`; it fetches [latest.json](https://github.com/Odin94/cutest-disk-tree/releases/latest/download/latest.json) from this repo’s releases. For production builds use `./scripts/release.sh`, which sets the updater pubkey from `.tauri-public-key` (see [Releasing](#releasing-github)).
+- **Check for updates**: Uses `tauri-plugin-updater`; it fetches [latest.json](https://github.com/Odin94/cutest-disk-tree/releases/latest/download/latest.json) from this repo’s releases. For production builds use `./scripts/build-all-platforms.sh`, which signs the build and generates release artifacts (see [Releasing](#releasing-github)).
 
 Scan results are stored in SQLite in the app data directory (`index.db`). Each scan overwrites data for that root path; you can re-scan to refresh.
 
@@ -67,12 +67,14 @@ npm run tauri build
 Releases are published to [Odin94/cutest-disk-tree](https://github.com/Odin94/cutest-disk-tree). The in-app “Check for updates” uses `latest.json` from the latest release.
 
 ### One-time setup (signing)
+NOTE: This signature is for tauri auto-updater to know the updates are authentic. It's NOT valid for Windows/Apple Store etc. See [tauri docs](https://v2.tauri.app/plugin/updater/)
 
 1. Generate a key pair (keep the private key secret and backed up):
    ```bash
-   npm run tauri signer generate -w ~/.tauri/cutest-disk-tree.key
+   npm run tauri -- signer generate -w ./.tauri-updater-key
    ```
-2. Save the **private** key as `.tauri-private-key` and the **public** key as `.tauri-public-key` in the repo root (base64-encoded). The release script reads these and sets `plugins.updater.pubkey` in `tauri.conf.json` at build time. Keep `.tauri-private-key` out of version control (it is in `.gitignore`).
+   This creates `.tauri-updater-key` (private) and `.tauri-updater-key.pub` (public) in the repo root. Both are base64-wrapped minisign keys.
+2. Keep `.tauri-updater-key` out of version control (it is in `.gitignore`). The build script reads the private key for signing, and the release script reads the public key to patch `plugins.updater.pubkey` in `tauri.conf.json`.
 
 ### For each release (recommended: use the script)
 
@@ -87,15 +89,17 @@ Releases are published to [Odin94/cutest-disk-tree](https://github.com/Odin94/cu
 ### For each release (manual)
 
 If you prefer not to use the script:
+1. Set the signing env vars and build:
    ```bash
-   $env:TAURI_SIGNING_PRIVATE_KEY="<path-or-content-of-private-key>"
+   export TAURI_SIGNING_PRIVATE_KEY=”$(tr -d ‘\r\n’ < .tauri-updater-key)”
+   export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=”pass”
    npm run tauri build
    ```
-   On macOS/Linux use `export TAURI_SIGNING_PRIVATE_KEY="..."` instead.
-3. Open [Releases](https://github.com/Odin94/cutest-disk-tree/releases) → “Draft a new release”.
-4. Create a tag (e.g. `v0.1.1`) and publish the release.
-5. Upload the built artifacts from `src-tauri/target/release/bundle/` and add `latest.json` as described in the script’s output (or in the “Check for updates” paragraph below).
-6. Publish the release.
+   On PowerShell use `$env:TAURI_SIGNING_PRIVATE_KEY = ...` instead.
+2. Open [Releases](https://github.com/Odin94/cutest-disk-tree/releases) → “Draft a new release”.
+3. Create a tag (e.g. `v0.1.1`) and publish the release.
+4. Upload the built artifacts from `src-tauri/target/release/bundle/` and add `latest.json` as described in the script’s output (or in the “Check for updates” paragraph below).
+5. Publish the release.
 
 After that, existing installs will see the update when users click “Check for updates”.
 
@@ -135,6 +139,12 @@ Walk a directory tree, aggregate folder sizes, and avoid double-counting hard li
 
 ```bash
 cargo build
+```
+
+**Test**
+
+```bash
+cargo test && cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 **Run**:

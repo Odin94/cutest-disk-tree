@@ -8,6 +8,33 @@ REPO_OWNER="Odin94"
 REPO_NAME="cutest-disk-tree"
 GITHUB_RELEASES_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# read_key_file FILE
+#   Reads a Tauri signing key file and prints the raw rsign content.
+#   Accepts either:
+#     • raw rsign format  (starts with "untrusted comment:")
+#     • base64-wrapped    (a single base64 blob encoding the rsign content)
+read_key_file() {
+  local file="$1"
+  local content
+  content="$(cat "$file" | tr -d '\r')"
+
+  if [[ "$content" == untrusted\ comment:* ]]; then
+    printf '%s\n' "$content"
+  else
+    local stripped
+    stripped="$(printf '%s' "$content" | tr -d '\n')"
+    printf '%s' "$stripped" | base64 -d 2>/dev/null \
+      || printf '%s' "$stripped" | base64 -D 2>/dev/null \
+      || { echo "Error: Could not decode $file (expected raw rsign key or base64-wrapped rsign key)." >&2; exit 1; }
+  fi
+}
+
+# ---------------------------------------------------------------------------
+
 echo "=== Cutest Disk Tree – Release script ==="
 echo "Repo root: $REPO_ROOT"
 echo ""
@@ -25,24 +52,22 @@ if [[ -z "${RELEASE_SKIP_CONFIRM:-}" ]]; then
     echo "Stopping. Complete the steps above and run this script again."
     echo ""
     echo "To build with signing before re-running this script:"
-    echo "  export TAURI_SIGNING_PRIVATE_KEY=\"\$(cat .tauri-private-key | base64 -d 2>/dev/null || cat .tauri-private-key | base64 -D)\""
+    echo "  export TAURI_SIGNING_PRIVATE_KEY=\"\$(cat .tauri-updater-key)\""
     echo "  npm run tauri build"
     exit 1
   fi
 fi
 
-if [[ ! -f ".tauri-private-key" ]] || [[ ! -f ".tauri-public-key" ]]; then
-  echo "Error: .tauri-private-key and .tauri-public-key must exist in the repo root."
+if [[ ! -f ".tauri-updater-key" ]] || [[ ! -f ".tauri-updater-key.pub" ]]; then
+  echo "Error: .tauri-updater-key and .tauri-updater-key.pub must exist in the repo root."
   exit 1
 fi
 
-PRIVATE_KEY_B64="$(cat .tauri-private-key)"
-PUBLIC_KEY_B64="$(cat .tauri-public-key)"
-TAURI_PRIVATE_KEY="$(echo "$PRIVATE_KEY_B64" | base64 -d 2>/dev/null || echo "$PRIVATE_KEY_B64" | base64 -D 2>/dev/null)"
-TAURI_PUBLIC_KEY="$(echo "$PUBLIC_KEY_B64" | base64 -d 2>/dev/null || echo "$PUBLIC_KEY_B64" | base64 -D 2>/dev/null)"
+# The pubkey config expects the base64-wrapped content (raw file content, not decoded).
+TAURI_PUBLIC_KEY="$(tr -d '\r\n' < .tauri-updater-key.pub)"
 
 if [[ -z "$TAURI_PUBLIC_KEY" ]]; then
-  echo "Error: Could not decode .tauri-public-key (expected base64)."
+  echo "Error: Could not read .tauri-updater-key.pub."
   exit 1
 fi
 
